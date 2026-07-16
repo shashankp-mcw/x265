@@ -610,6 +610,22 @@ void Encoder::create()
     else
          m_enableNal = 0;
 
+#if ENABLE_TRACY
+    char tracyInfo[512];
+    snprintf(tracyInfo, sizeof(tracyInfo),
+             "x265 %s\nsource: %dx%d\ninternal bit depth: %d\nframe threads: %d\nthread pools: %d\nwpp: %s",
+             PFX(version_str), p->sourceWidth, p->sourceHeight, X265_DEPTH,
+             p->frameNumThreads, m_numPools, p->bEnableWavefront ? "enabled" : "disabled");
+    PROFILE_APP_INFO(tracyInfo);
+
+    char* tracyOptions = x265_param2string(p, 0, 0);
+    if (tracyOptions)
+    {
+        PROFILE_APP_INFO(tracyOptions);
+        X265_FREE(tracyOptions);
+    }
+#endif
+
 #if ENABLE_HDR10_PLUS
     if (m_bToneMap)
         m_numCimInfo = m_hdr10plus_api->hdr10plus_json_to_movie_cim(m_param->toneMapFile, m_cim);
@@ -1471,6 +1487,9 @@ bool Encoder::isFilterThisframe(uint8_t sliceTypeConfig, int curSliceType)
  *         negative on malloc error or abort */
 int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
 {
+    ProfileScopeEvent(apiEncode);
+    PROFILE_SCOPE_VALUE(pic_in ? (uint32_t)pic_in->poc : UINT32_MAX);
+
 #if CHECKED_BUILD || _DEBUG
     if (g_checkFailures)
     {
@@ -2147,6 +2166,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
 
                 if ((m_outputCount + 1) >= m_param->chunkStart)
                     finishFrameStats(outFrame, curEncoder, frameData, m_pocLast, sLayer);
+
+                if (!sLayer)
+                {
+                    PROFILE_PLOT("x265 frame bits", (int64_t)curEncoder->m_accessUnitBits[sLayer]);
+                    PROFILE_PLOT("x265 frame QP", outFrame->m_encData->m_avgQpAq);
+                }
                 if (strlen(m_param->analysisSave))
                 {
                     pic_out[sLayer].analysisData.frameBits = frameData->bits;
@@ -2230,6 +2255,9 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
 
                 ret = 1;
             }
+
+            PROFILE_PLOT("x265 delayed frames", (int64_t)m_numDelayedPic);
+            PROFILE_FRAME_MARK();
         }
 
         /* pop a single frame from decided list, then provide to frame encoder
@@ -6518,4 +6546,3 @@ fail:
     }
     return false;
 }
-

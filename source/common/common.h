@@ -43,8 +43,8 @@
 
 #include "x265.h"
 
-#if ENABLE_PPA && ENABLE_VTUNE
-#error "PPA and VTUNE cannot both be enabled. Disable one of them."
+#if (ENABLE_PPA && ENABLE_VTUNE) || (ENABLE_PPA && ENABLE_TRACY) || (ENABLE_VTUNE && ENABLE_TRACY)
+#error "PPA, VTune, and Tracy profiling backends are mutually exclusive."
 #endif
 #if ENABLE_PPA
 #include "profile/PPA/ppa.h"
@@ -53,6 +53,10 @@
 #define PROFILE_INIT()       PPA_INIT()
 #define PROFILE_PAUSE()
 #define PROFILE_RESUME()
+#define PROFILE_SCOPE_VALUE(x)
+#define PROFILE_FRAME_MARK()
+#define PROFILE_PLOT(n, v)
+#define PROFILE_APP_INFO(t)
 #elif ENABLE_VTUNE
 #include "profile/vtune/vtune.h"
 #define ProfileScopeEvent(x) VTuneScopeEvent _vtuneTask(x)
@@ -60,12 +64,31 @@
 #define PROFILE_INIT()       vtuneInit()
 #define PROFILE_PAUSE()      __itt_pause()
 #define PROFILE_RESUME()     __itt_resume()
+#define PROFILE_SCOPE_VALUE(x)
+#define PROFILE_FRAME_MARK()
+#define PROFILE_PLOT(n, v)
+#define PROFILE_APP_INFO(t)
+#elif ENABLE_TRACY
+#include "profile/tracy/tracy.h"
+#define ProfileScopeEvent(x) X265_TRACY_SCOPE_EVENT(x)
+#define THREAD_NAME(n,i)     X265_NS::tracySetThreadName(n, i)
+#define PROFILE_INIT()
+#define PROFILE_PAUSE()
+#define PROFILE_RESUME()
+#define PROFILE_SCOPE_VALUE(x) X265_TRACY_SCOPE_VALUE(x)
+#define PROFILE_FRAME_MARK() X265_TRACY_FRAME_MARK()
+#define PROFILE_PLOT(n, v)   X265_NS::tracyPlot(n, v)
+#define PROFILE_APP_INFO(t)  X265_NS::tracyAppInfo(t)
 #else
 #define ProfileScopeEvent(x)
 #define THREAD_NAME(n,i)
 #define PROFILE_INIT()
 #define PROFILE_PAUSE()
 #define PROFILE_RESUME()
+#define PROFILE_SCOPE_VALUE(x)
+#define PROFILE_FRAME_MARK()
+#define PROFILE_PLOT(n, v)
+#define PROFILE_APP_INFO(t)
 #endif
 
 #define FENC_STRIDE 64

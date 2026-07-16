@@ -7,6 +7,7 @@ x265 Documentation
    cli
    api
    threading
+   profiling
    presets
    lossless
    svthevc

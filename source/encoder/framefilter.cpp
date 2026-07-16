@@ -561,6 +561,7 @@ void FrameFilter::ParallelFilter::processTasks(int /*workerThreadId*/)
 void FrameFilter::processRow(int row, int layer)
 {
     ProfileScopeEvent(filterCTURow);
+    PROFILE_SCOPE_VALUE((uint32_t)row);
 
 #if DETAILED_CU_STATS
     ScopedElapsedTime filterPerfScope(m_frameEncoder->m_cuStats.loopFilterElapsedTime);

@@ -129,6 +129,8 @@ void ThreadedME::enqueueReadyRows(int row, int layer, FrameEncoder* frameEnc)
 
 void ThreadedME::threadMain()
 {
+    THREAD_NAME("ThreadedME", m_jpId);
+
     while (m_active)
     {
         int newCTUsPushed = 0;
@@ -155,12 +157,17 @@ void ThreadedME::threadMain()
         }
 
         if (newCTUsPushed == 0)
+        {
+            ProfileScopeEvent(threadedMEWait);
             m_taskEvent.wait();
+        }
     }
 }
 
 void ThreadedME::findJob(int workerThreadId)
 {
+    ProfileScopeEvent(threadedME);
+
     m_taskQueueLock.acquire();
     if (m_taskQueue.empty())
     {

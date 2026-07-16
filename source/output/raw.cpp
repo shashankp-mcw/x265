@@ -22,6 +22,7 @@
  * For more information, contact us at license @ x265.com.
  *****************************************************************************/
 #include "raw.h"
+#include "common.h"
 #if _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -55,6 +56,7 @@ void RAWOutput::setParam(x265_param* param)
 
 int RAWOutput::writeHeaders(const x265_nal* nal, uint32_t nalcount)
 {
+    ProfileScopeEvent(bitstreamWrite);
     uint32_t bytes = 0;
 
     for (uint32_t i = 0; i < nalcount; i++)
@@ -64,11 +66,13 @@ int RAWOutput::writeHeaders(const x265_nal* nal, uint32_t nalcount)
         nal++;
     }
 
+    PROFILE_SCOPE_VALUE(bytes);
     return bytes;
 }
 
 int RAWOutput::writeFrame(const x265_nal* nal, uint32_t nalcount, x265_picture&)
 {
+    ProfileScopeEvent(bitstreamWrite);
     uint32_t bytes = 0;
 
     for (uint32_t i = 0; i < nalcount; i++)
@@ -78,6 +82,7 @@ int RAWOutput::writeFrame(const x265_nal* nal, uint32_t nalcount, x265_picture&)
         nal++;
     }
 
+    PROFILE_SCOPE_VALUE(bytes);
     return bytes;
 }
 

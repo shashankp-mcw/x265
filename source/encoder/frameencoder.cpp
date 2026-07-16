@@ -446,6 +446,7 @@ void FrameEncoder::writeTrailingSEIMessages(int layer)
 void FrameEncoder::compressFrame(int layer)
 {
     ProfileScopeEvent(frameThread);
+    PROFILE_SCOPE_VALUE((uint32_t)m_frame[layer]->m_poc);
 
     m_startCompressTime[layer] = x265_mdate();
     m_totalActiveWorkerCount = 0;
@@ -1489,7 +1490,9 @@ void FrameEncoder::encodeSlice(uint32_t sliceAddr, int layer)
 void FrameEncoder::processRow(int row, int threadId, int layer)
 {
     int64_t startTime = x265_mdate();
-    if (ATOMIC_INC(&m_activeWorkerCount) == 1 && m_stallStartTime[layer])
+    int activeWorkers = ATOMIC_INC(&m_activeWorkerCount);
+    PROFILE_PLOT("x265 active workers", (int64_t)activeWorkers);
+    if (activeWorkers == 1 && m_stallStartTime[layer])
         m_totalNoWorkerTime[layer] += x265_mdate() - m_stallStartTime[layer];
 
     const uint32_t realRow = m_idx_to_row[row >> 1];
@@ -1508,7 +1511,9 @@ void FrameEncoder::processRow(int row, int threadId, int layer)
             enqueueRowFilter(m_row_to_idx[realRow + 1]);
     }
 
-    if (ATOMIC_DEC(&m_activeWorkerCount) == 0)
+    activeWorkers = ATOMIC_DEC(&m_activeWorkerCount);
+    PROFILE_PLOT("x265 active workers", (int64_t)activeWorkers);
+    if (activeWorkers == 0)
         m_stallStartTime[layer] = x265_mdate();
 
     m_totalWorkerElapsedTime[layer] += x265_mdate() - startTime; // not thread safe, but good enough
@@ -1518,6 +1523,8 @@ void FrameEncoder::processRow(int row, int threadId, int layer)
 void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer)
 {
     const uint32_t row = (uint32_t)intRow;
+    ProfileScopeEvent(encodeRow);
+    PROFILE_SCOPE_VALUE(row);
     CTURow& curRow = m_rows[row];
 
     if (m_param->bEnableWavefront)
@@ -1641,6 +1648,7 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
 
         const uint32_t col = curRow.completed;
         const uint32_t cuAddr = lineStartCUAddr + col;
+        PROFILE_SCOPE_VALUE(cuAddr);
         CUData* ctu = curEncData.getPicCTU(cuAddr);
         const uint32_t bLastCuInSlice = (bLastRowInSlice & (col == numCols - 1)) ? 1 : 0;
 
@@ -1652,13 +1660,20 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
             int64_t waitStart = x265_mdate();
             bool waited = false;
 
-            while (m_frame[layer]->m_ctuMEFlags[cuAddr].get() == 0)
+            if (m_frame[layer]->m_ctuMEFlags[cuAddr].get() == 0)
             {
+                ProfileScopeEvent(threadedMEWait);
+                PROFILE_SCOPE_VALUE(cuAddr);
+
+                do
+                {
 #ifdef DETAILED_CU_STATS
-                tld.analysis.m_stats[m_jpId].countTmeBlockedCTUs++;
+                    tld.analysis.m_stats[m_jpId].countTmeBlockedCTUs++;
 #endif
-                m_frame[layer]->m_ctuMEFlags[cuAddr].waitForChange(0);
-                waited = true;
+                    m_frame[layer]->m_ctuMEFlags[cuAddr].waitForChange(0);
+                    waited = true;
+                }
+                while (m_frame[layer]->m_ctuMEFlags[cuAddr].get() == 0);
             }
 
             int64_t waitEnd = x265_mdate();
@@ -2586,7 +2601,11 @@ Frame** FrameEncoder::getEncodedPicture(NALList& output)
     if (m_frame[0] && (m_param->numLayers <= 1 || (MAX_LAYERS > 1 && m_frame[1])))
     {
         /* block here until worker thread completes */
-        m_done.wait();
+        {
+            ProfileScopeEvent(frameWait);
+            PROFILE_SCOPE_VALUE((uint32_t)m_frame[0]->m_poc);
+            m_done.wait();
+        }
 
         for (int i = 0; i < m_param->numLayers; i++)
         {

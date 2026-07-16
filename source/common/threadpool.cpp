@@ -153,7 +153,10 @@ void WorkerThread::threadMain()
         do
         {
             /* do pending work for current job provider */
-            m_curJobProvider->findJob(m_id);
+            {
+                ProfileScopeEvent(workerJob);
+                m_curJobProvider->findJob(m_id);
+            }
 
             /* if the current job provider still wants help, only switch to a
              * higher priority provider (lower slice type). Else take the first

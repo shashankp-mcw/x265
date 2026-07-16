@@ -738,6 +738,8 @@ endif()
 # Build options
 set(LIB_INSTALL_DIR lib CACHE STRING "Install location of libraries")
 set(BIN_INSTALL_DIR bin CACHE STRING "Install location of executables")
+option(ENABLE_SHARED "Build shared library" ON)
+set(ENABLE_CLI ON CACHE BOOL "Build standalone CLI application")
 set(EXTRA_LIB "" CACHE STRING "Extra libraries to link against")
 set(EXTRA_LINK_FLAGS "" CACHE STRING "Extra link flags")
 if(EXTRA_LINK_FLAGS)
@@ -896,6 +898,87 @@ if(ENABLE_VTUNE)
         add_subdirectory(profile/vtune)
     endif(VTUNE_FOUND)
 endif(ENABLE_VTUNE)
+
+option(ENABLE_TRACY "Enable Tracy profiling instrumentation" OFF)
+option(X265_TRACY_ON_DEMAND "Only collect Tracy data while a profiler is connected" ON)
+option(X265_TRACY_ONLY_LOCALHOST "Only accept Tracy profiler connections from localhost" ON)
+set(X265_TRACY_CALLSTACK_DEPTH "0" CACHE STRING "Call stack depth for Tracy zones (0 disables zone call stacks)")
+mark_as_advanced(X265_TRACY_ON_DEMAND X265_TRACY_ONLY_LOCALHOST X265_TRACY_CALLSTACK_DEPTH)
+
+if(ENABLE_TRACY)
+    if(CMAKE_VERSION VERSION_LESS "3.10")
+        message(FATAL_ERROR "ENABLE_TRACY requires CMake 3.10 or newer")
+    endif()
+    if(ENABLE_PPA OR ENABLE_VTUNE)
+        message(FATAL_ERROR "Tracy, PPA, and VTune profiling backends are mutually exclusive")
+    endif()
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/profile/tracy/vendor/public/TracyClient.cpp")
+        message(FATAL_ERROR
+            "Tracy source is missing. Run: git submodule update --init source/profile/tracy/vendor")
+    endif()
+    if(NOT X265_TRACY_CALLSTACK_DEPTH MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "X265_TRACY_CALLSTACK_DEPTH must be a non-negative integer")
+    endif()
+
+    add_definitions(-DENABLE_TRACY=1 -DTRACY_ENABLE=1)
+    if(X265_TRACY_ON_DEMAND)
+        add_definitions(-DTRACY_ON_DEMAND=1)
+    endif()
+    if(X265_TRACY_ONLY_LOCALHOST)
+        add_definitions(-DTRACY_ONLY_LOCALHOST=1)
+    endif()
+    if(X265_TRACY_CALLSTACK_DEPTH GREATER 0)
+        add_definitions(-DTRACY_CALLSTACK=${X265_TRACY_CALLSTACK_DEPTH})
+    endif()
+
+    add_library(x265-tracy-adapter OBJECT
+        profile/tracy/tracy.cpp
+        profile/tracy/tracy.h)
+    set_target_properties(x265-tracy-adapter PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    set(TRACY_OBJS $<TARGET_OBJECTS:x265-tracy-adapter>)
+
+    # TracyClient must occur exactly once in a combined 8/10/12-bit library.
+    # Internal bit-depth archives disable the C API, shared library, and CLI;
+    # a build producing any standalone artifact owns the client object.
+    if(EXPORT_C_API OR ENABLE_SHARED OR ENABLE_CLI)
+        add_library(x265-tracy-client OBJECT profile/tracy/vendor/public/TracyClient.cpp)
+        target_compile_features(x265-tracy-client PRIVATE cxx_std_17)
+        # Tracy's API annotation exports symbols for a standalone Tracy shared
+        # library. The client is embedded here, so keep it out of libx265's ABI.
+        target_compile_definitions(x265-tracy-client PRIVATE
+            __TRACYAPI_H__ TRACY_API=)
+        if(GCC)
+            # x265 otherwise pins GNU/Clang builds to gnu++98. This target is
+            # the only part of the integration that requires a modern mode.
+            # Keep third-party warnings separate from x265's warning policy.
+            target_compile_options(x265-tracy-client PRIVATE
+                -std=gnu++17 -Wno-error -Wno-shadow -Wno-unused-parameter
+                -Wno-missing-field-initializers)
+        endif()
+        set_target_properties(x265-tracy-client PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON)
+        list(APPEND TRACY_OBJS $<TARGET_OBJECTS:x265-tracy-client>)
+    endif()
+
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        list(APPEND PLATFORM_LIBS ws2_32 dbghelp)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+        find_library(EXECINFO_LIBRARY NAMES execinfo)
+        if(NOT EXECINFO_LIBRARY)
+            message(FATAL_ERROR "Tracy requires libexecinfo on FreeBSD")
+        endif()
+        list(APPEND PLATFORM_LIBS ${EXECINFO_LIBRARY})
+    endif()
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux|FreeBSD|OpenBSD|Android")
+        set(TRACY_SHARED_LINKER_OPTION
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/profile/tracy/tracy.map")
+    endif()
+endif(ENABLE_TRACY)
 
 option(DETAILED_CU_STATS "Enable internal profiling of encoder work" OFF)
 if(DETAILED_CU_STATS)
@@ -1058,11 +1141,11 @@ if((MSVC_IDE OR XCODE OR GCC) AND ENABLE_ASSEMBLY)
 endif()
 source_group(ASM FILES ${ASM_SRCS})
 if(ENABLE_HDR10_PLUS)
-    add_library(x265-static STATIC $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10> ${ASM_OBJS})
+    add_library(x265-static STATIC $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10> ${ASM_OBJS} ${TRACY_OBJS})
     add_library(hdr10plus-static STATIC $<TARGET_OBJECTS:dynamicHDR10>)
     set_target_properties(hdr10plus-static PROPERTIES OUTPUT_NAME hdr10plus)
 else()
-    add_library(x265-static STATIC $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> ${ASM_OBJS})
+    add_library(x265-static STATIC $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> ${ASM_OBJS} ${TRACY_OBJS})
 endif()
 if(NOT MSVC)
     set_target_properties(x265-static PROPERTIES OUTPUT_NAME x265)
@@ -1132,11 +1215,10 @@ endif()
 if(NOT (MSVC_IDE OR XCODE))
     add_custom_target(clean-generated COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/clean-generated.cmake)
 endif()
-option(ENABLE_SHARED "Build shared library" ON)
 if(ENABLE_SHARED)
     if(ENABLE_HDR10_PLUS)
         add_library(x265-shared SHARED "${PROJECT_BINARY_DIR}/x265.def" ${ASM_OBJS}
-                    ${X265_RC_FILE} $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10>)
+                    ${X265_RC_FILE} $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10> ${TRACY_OBJS})
         add_library(hdr10plus-shared SHARED $<TARGET_OBJECTS:dynamicHDR10>)
 
         if(MSVC)
@@ -1146,7 +1228,7 @@ if(ENABLE_SHARED)
         endif()
     else()
         add_library(x265-shared SHARED "${PROJECT_BINARY_DIR}/x265.def" ${ASM_OBJS}
-                   ${X265_RC_FILE} $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common>)
+                   ${X265_RC_FILE} $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> ${TRACY_OBJS})
     endif()
     if(EXTRA_LIB)
         target_link_libraries(x265-shared ${EXTRA_LIB})
@@ -1191,6 +1273,12 @@ if(ENABLE_SHARED)
         string(REPLACE ";" " " LINKER_OPTION_STR "${LINKER_OPTIONS}")
         set_target_properties(x265-shared PROPERTIES LINK_FLAGS "${LINKER_OPTION_STR}")
     endif()
+    if(TRACY_SHARED_LINKER_OPTION)
+        set_property(TARGET x265-shared APPEND_STRING PROPERTY LINK_FLAGS
+            " ${TRACY_SHARED_LINKER_OPTION}")
+        set_property(TARGET x265-shared APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/profile/tracy/tracy.map")
+    endif()
 endif()
 
 if(X265_LATEST_TAG OR NOT GIT_FOUND)
@@ -1225,7 +1313,6 @@ add_custom_target(uninstall
                   "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_BINARY_DIR}/cmake/cmake_uninstall.cmake")
 
 # Main CLI application
-set(ENABLE_CLI ON CACHE BOOL "Build standalone CLI application")
 if(ENABLE_CLI)
     file(GLOB InputFiles input/input.cpp input/yuv.cpp input/y4m.cpp input/*.h)
     file(GLOB OutputFiles output/output.cpp output/reconplay.cpp output/*.h
@@ -1250,18 +1337,19 @@ if(ENABLE_CLI)
         if(ENABLE_HDR10_PLUS)
         add_executable(cli ../COPYING ${InputFiles} ${OutputFiles} ${GETOPT}
                         x265.cpp x265.h x265cli.cpp x265cli.h abrEncApp.cpp abrEncApp.h
-                        $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10> ${ASM_OBJS})
+                        $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> $<TARGET_OBJECTS:dynamicHDR10> ${ASM_OBJS} ${TRACY_OBJS})
         else()
             add_executable(cli ../COPYING ${InputFiles} ${OutputFiles} ${GETOPT}
                         x265.cpp x265.h x265cli.cpp x265cli.h abrEncApp.cpp abrEncApp.h
-                        $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> ${ASM_OBJS})
+                        $<TARGET_OBJECTS:encoder> $<TARGET_OBJECTS:common> ${ASM_OBJS} ${TRACY_OBJS})
         endif()
     else()
         add_executable(cli ../COPYING ${InputFiles} ${OutputFiles} ${GETOPT} ${X265_RC_FILE}
                        ${ExportDefs} x265.cpp x265.h x265cli.cpp x265cli.h abrEncApp.cpp abrEncApp.h)
-        if(WIN32 OR NOT ENABLE_SHARED OR INTEL_CXX)
+        if(WIN32 OR NOT ENABLE_SHARED OR INTEL_CXX OR ENABLE_TRACY)
             # The CLI cannot link to the shared library on Windows, it
-            # requires internal APIs not exported from the DLL
+            # requires internal APIs not exported from the DLL. Tracy builds
+            # likewise keep their profiler implementation symbols private.
             target_link_libraries(cli x265-static ${PLATFORM_LIBS})
         else()
             target_link_libraries(cli x265-shared ${PLATFORM_LIBS})
