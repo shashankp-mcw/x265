@@ -281,3 +281,7 @@ add_library(common OBJECT
     scaler.cpp scaler.h
     ringmem.cpp ringmem.h
     temporalfilter.cpp temporalfilter.h)
+
+# libfork headers (INTERFACE target: include dirs + compile defs only here,
+# the actual link deps are pulled in by x265-static/x265-shared)
+target_link_libraries(common PRIVATE libfork::libfork)

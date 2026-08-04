@@ -45,3 +45,5 @@ add_library(encoder OBJECT ../x265.h
     api.cpp
     weightPrediction.cpp svt.h
     threadedme.h threadedme.cpp)
+
+target_link_libraries(encoder PRIVATE libfork::libfork)

@@ -12,6 +12,8 @@ if(POLICY CMP0042)
 endif()
 
 cmake_minimum_required (VERSION 2.8.8...3.10) # OBJECT libraries require 2.8.8
+set(CMAKE_CXX_STANDARD 23) # libfork requires C++23 (coroutines + std::expected)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (POLICY CMP0075)
     cmake_policy(SET CMP0075 NEW) # CMAKE_REQUIRED_LIBRARIES warning
@@ -25,6 +27,24 @@ include(CheckSymbolExists)
 include(CheckCXXCompilerFlag)
 include(CheckCSourceCompiles)
 include(CheckCXXSourceCompiles)
+
+# Fetch libfork (header-only, needs C++20 coroutines + C++23 library bits)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12.0)
+    message(FATAL_ERROR "gcc 12 or newer is required to build with libfork")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16.0)
+    message(FATAL_ERROR "clang 16 or newer is required to build with libfork")
+endif()
+include(FetchContent)
+FetchContent_Declare(
+    libfork
+    GIT_REPOSITORY https://github.com/conorwilliams/libfork.git
+    GIT_TAG v3.7.2
+    GIT_SHALLOW TRUE
+)
+# libfork is header-only; do not export/install its headers with x265
+set(CMAKE_SKIP_INSTALL_RULES ON)
+FetchContent_MakeAvailable(libfork)
+unset(CMAKE_SKIP_INSTALL_RULES)
 
 option(FPROFILE_GENERATE "Compile executable to generate usage data" OFF)
 option(FPROFILE_USE "Compile executable using generated usage data" OFF)
@@ -169,6 +189,13 @@ if(UNIX)
     if(LIBDL)
         list(APPEND PLATFORM_LIBS dl)
     endif()
+    # libfork links hwloc when it finds it; record it for Libs.private so that
+    # consumers of the static libx265 can link successfully
+    get_target_property(LF_DEFS libfork_libfork INTERFACE_COMPILE_DEFINITIONS)
+    if(LF_DEFS AND "LF_USE_HWLOC" IN_LIST LF_DEFS)
+        list(APPEND PLATFORM_LIBS hwloc)
+    endif()
+    unset(LF_DEFS)
     option(ENABLE_LIBNUMA "Enable libnuma usage (Linux only)" ON)
     if(ENABLE_LIBNUMA)
         find_package(Numa)
@@ -296,10 +323,9 @@ if(GCC)
         if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.8")
             message(FATAL_ERROR "gcc version above 4.8 required to support hdr10plus")
         endif()
-        add_definitions(-std=gnu++11)
-    else()
-        add_definitions(-std=gnu++98)
     endif()
+    # The C++ dialect is driven by CMAKE_CXX_STANDARD (C++23, required by
+    # libfork); do not pin -std here or it will override it.
     if(ENABLE_PIC)
          add_definitions(-fPIC)
     endif(ENABLE_PIC)
@@ -1067,6 +1093,8 @@ endif()
 if(NOT MSVC)
     set_target_properties(x265-static PROPERTIES OUTPUT_NAME x265)
 endif()
+# libfork transitive deps (Threads, and hwloc/boost::atomic when found)
+target_link_libraries(x265-static libfork::libfork)
 if(EXTRA_LIB)
     target_link_libraries(x265-static ${EXTRA_LIB})
 endif()
@@ -1152,6 +1180,7 @@ if(ENABLE_SHARED)
         target_link_libraries(x265-shared ${EXTRA_LIB})
     endif()
 	 target_link_libraries(x265-shared ${PLATFORM_LIBS})
+    target_link_libraries(x265-shared libfork::libfork)
     if(SVTHEVC_FOUND)
         target_link_libraries(x265-shared ${SVT_HEVC_LIBRARY})
     endif(SVTHEVC_FOUND)
