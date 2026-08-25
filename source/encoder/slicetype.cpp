@@ -1068,7 +1068,7 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
     m_fadeCount = 0;
     m_fadeStart = -1;
     m_origPicBuf = 0;
-    m_metld = NULL;
+    m_fjp = NULL;
 
     /* Allow the strength to be adjusted via qcompress, since the two concepts
      * are very similar. */
@@ -1083,12 +1083,11 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
                        m_param->bAQMotion ||
                        m_param->rc.hevcAq;
 
-    /* If we have a thread pool and are using --b-adapt 2, it is generally
-     * preferable to perform all motion searches for each lowres frame in large
-     * batched; this will create one job per --bframe per lowres frame, and
-     * these jobs are performed by workers bonded to the thread running
-     * slicetypeDecide() */
-    m_bBatchMotionSearch = m_pool && m_param->bFrameAdaptive == X265_B_ADAPT_TRELLIS;
+    /* When the fork-join pool has more than one worker and we are using
+     * --b-adapt 2, it is generally preferable to perform all motion searches
+     * for each lowres frame in large batches; this will create one task per
+     * --bframe per lowres frame, executed on the fork-join pool workers */
+    m_bBatchMotionSearch = ForkJoinPool::workerCount(m_param) > 1 && m_param->bFrameAdaptive == X265_B_ADAPT_TRELLIS;
 
     /* It is also beneficial to pre-calculate all possible frame cost estimates
      * using worker threads bonded to the worker thread running
@@ -1099,17 +1098,16 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
      * of work */
     m_bBatchFrameCosts = m_bBatchMotionSearch;
 
-    /* MCSTF motion search is independent of --b-adapt: it reuses the batched
-     * CostEstimateGroup plumbing but is functionally decoupled from the frame
-     * cost DP. finishBatch() runs serially on the lookahead thread when no pool
-     * is present, so this needs neither a pool nor trellis b-adapt. Unlike
-     * m_bBatchMotionSearch it must NOT self-disable on small pools (MCSTF has no
-     * lazy fallback), so keep it a simple enable flag. */
+    /* MCSTF motion search is independent of --b-adapt: it runs as its own
+     * batch of fork-join tasks, fully decoupled from the frame cost DP, so
+     * this needs neither trellis b-adapt nor a large pool. Unlike
+     * m_bBatchMotionSearch it must NOT self-disable on small pools (MCSTF has
+     * no lazy fallback), so keep it a simple enable flag. */
     m_bMcstfMotionSearch = m_param->bEnableTemporalFilter;
 
-    if (m_param->lookaheadSlices && !m_pool)
+    if (m_param->lookaheadSlices && ForkJoinPool::workerCount(m_param) <= 1)
     {
-        x265_log(param, X265_LOG_WARNING, "No pools found; disabling lookahead-slices\n");
+        x265_log(param, X265_LOG_WARNING, "Single fork-join worker; disabling lookahead-slices\n");
         m_param->lookaheadSlices = 0;
     }
 
@@ -1198,12 +1196,13 @@ void Lookahead::getWorkerStats(int64_t& framecostBatchElapsedTime, int64_t& coop
     framecostBatchElapsedTime = 0;
     coopSliceElapsedTime = 0;
     mcstfBatchElapsedTime = 0;
-    int tldCount = m_pool ? m_pool->m_numWorkers : 1;
-    for (int i = 0; i < tldCount; i++)
+    int slotCount = m_fjp ? m_fjp->m_arena.m_count : 0;
+    for (int i = 0; i < slotCount; i++)
     {
-        framecostBatchElapsedTime += m_tld[i].framecostBatchElapsedTime;
-        coopSliceElapsedTime += m_tld[i].coopSliceElapsedTime;
-        mcstfBatchElapsedTime += m_tld[i].mcstfBatchElapsedTime;
+        LookaheadTLD& tld = m_fjp->m_arena.m_slots[i].tld;
+        framecostBatchElapsedTime += tld.framecostBatchElapsedTime;
+        coopSliceElapsedTime += tld.coopSliceElapsedTime;
+        mcstfBatchElapsedTime += tld.mcstfBatchElapsedTime;
     }
 }
 #endif
@@ -1216,11 +1215,10 @@ bool Lookahead::create()
         m_tld[i].init(m_8x8Width, m_8x8Height, m_8x8Blocks);
     m_scratch = X265_MALLOC(int, m_tld[0].widthInCU);
 
+    m_fjp = new ForkJoinPool(*this);
+
     if (m_param->bEnableTemporalFilter)
-    {
-        m_metld = new MotionEstimatorTLD[numTLD];
         m_origPicBuf = new OrigPicBuffer();
-    }
 
     return m_tld && m_scratch;
 }
@@ -1262,10 +1260,9 @@ void Lookahead::destroy()
     }
 
     if (m_param->bEnableTemporalFilter)
-    {
         delete m_origPicBuf;
-        delete[] m_metld;
-    }
+
+    delete m_fjp;
 
     X265_FREE(m_accHistDiffRunningAvgCb[0]);
     X265_FREE(m_accHistDiffRunningAvgCb);
@@ -1888,19 +1885,18 @@ void Lookahead::placeBref(Frame** frames, int start, int end, int num, int *bref
 
 void Lookahead::compCostBref(Lowres **frames, int start, int end, int num)
 {
-    CostEstimateGroup estGroup(*this, frames);
     int avg = (start + end) / 2;
     if (num <= 2)
     {
         for (int i = start; i < end; i++)
         {
-            estGroup.singleCost(start, end + 1, i + 1);
+            singleCost(*m_fjp, frames, start, end + 1, i + 1);
         }
         return;
     }
     else
     {
-        estGroup.singleCost(start, end + 1, avg + 1);
+        singleCost(*m_fjp, frames, start, end + 1, avg + 1);
         compCostBref(frames, start, avg, avg - start);
         compCostBref(frames, avg + 1, end, end - avg);
         return;
@@ -2283,17 +2279,13 @@ void Lookahead::slicetypeDecide()
                 for(int i = 0; i < MOTION_ESTIMATION_LEVELS; i++)
                 {
                     const int numBlockRows = (levelHeight[i] + rowSize - 1) / rowSize;
-                    CostEstimateGroup estGroup(*this, frames);
 
                     for (int j = 1; j <= frameEnc->m_mcstf->m_numRef; j++)
                     {
-                        const TemporalFilterRefPicInfo* ref = &frameEnc->m_mcstfRefList[j - 1];
-                        int refpoc = ref->poc;
-
                         for (int row = 0; row < numBlockRows; row++)
-                                estGroup.addRow(j - 1, refpoc, frameEnc->m_poc, row, i, frameEnc);
+                            m_fjp->addMcstfRow(j - 1, row, i, frameEnc);
                     }
-                    estGroup.finishBatch();
+                    m_fjp->finishMcstfBatch();
                 }
             }
             frameEnc = frameEnc->m_next;
@@ -2350,9 +2342,8 @@ void Lookahead::slicetypeDecide()
                         p1 = b = newbFrames + 1;
                         p0 = (IS_X265_TYPE_I(frames[newbFrames + 1]->sliceType)) ? b : listReset;
 
-                        CostEstimateGroup estGroup(*this, frames);
 
-                        estGroup.singleCost(p0, p1, b);
+                        singleCost(*m_fjp, frames, p0, p1, b);
 
                         if (newbFrames)
                             compCostBref(frames, listReset, newbFrames, newbFrames + 1);
@@ -2435,9 +2426,8 @@ void Lookahead::slicetypeDecide()
                     p1 = b = newbFrames + 1;
                     p0 = (IS_X265_TYPE_I(frames[newbFrames + 1]->sliceType)) ? b : listReset;
 
-                    CostEstimateGroup estGroup(*this, frames);
 
-                    estGroup.singleCost(p0, p1, b);
+                    singleCost(*m_fjp, frames, p0, p1, b);
 
                     if (newbFrames)
                         compCostBref(frames, listReset, newbFrames, newbFrames + 1);
@@ -2521,8 +2511,7 @@ void Lookahead::slicetypeDecide()
                 p1 = b = bframes + 1;
                 p0 = (IS_X265_TYPE_I(frames[bframes + 1]->sliceType)) ? b : 0;
 
-                CostEstimateGroup estGroup(*this, frames);
-                estGroup.singleCost(p0, p1, b);
+                singleCost(*m_fjp, frames, p0, p1, b);
 
                 compCostBref(frames, 0, bframes, bframes + 1);
             }
@@ -2632,8 +2621,7 @@ void Lookahead::slicetypeDecide()
             p1 = b = bframes + 1;
             p0 = (IS_X265_TYPE_I(frames[bframes + 1]->sliceType)) ? b : 0;
 
-            CostEstimateGroup estGroup(*this, frames);
-            estGroup.singleCost(p0, p1, b);
+            singleCost(*m_fjp, frames, p0, p1, b);
 
             if (m_param->bEnableTemporalSubLayers > 1 && bframes)
             {
@@ -2657,7 +2645,7 @@ void Lookahead::slicetypeDecide()
                         else
                             p1 = bframes + 1;
 
-                        estGroup.singleCost(p0, p1, b);
+                        singleCost(*m_fjp, frames, p0, p1, b);
 
                         if (frames[b]->sliceType == X265_TYPE_BREF)
                         {
@@ -2829,8 +2817,7 @@ void Lookahead::vbvLookahead(Lowres **frames, int numFrames, int keyframe)
 
 int64_t Lookahead::vbvFrameCost(Lowres **frames, int p0, int p1, int b)
 {
-    CostEstimateGroup estGroup(*this, frames);
-    int64_t cost = estGroup.singleCost(p0, p1, b);
+    int64_t cost = singleCost(*m_fjp, frames, p0, p1, b);
 
     if (m_param->rc.aqMode || m_param->bAQMotion)
     {
@@ -2921,7 +2908,6 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
         {
             ProfileLookaheadTimeCount(m_framecostElapsedTime, m_countFramecosts);
             /* pre-calculate all motion searches, using many worker threads */
-            CostEstimateGroup estGroup(*this, frames);
             for (int b = 2; b < numFrames; b++)
             {
                 for (int i = 1; i <= m_param->bframes + 1; i++)
@@ -2939,12 +2925,12 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
                     if (p1 >= numFrames || frames[b]->lowresMvs[1][i][0].x != 0x7FFF)
                         p1 = b;
 
-                    estGroup.add(p0, p1, b);
+                    m_fjp->add(frames, p0, p1, b);
                 }
             }
-            /* auto-disable after the first batch if pool is small */
-            m_bBatchMotionSearch &= m_pool->m_numWorkers >= 4;
-            estGroup.finishBatch();
+            /* auto-disable after the first batch if the fork-join pool is small */
+            m_bBatchMotionSearch &= m_fjp->m_numWorkers >= 4;
+            m_fjp->finishBatch();
 
             if (m_bBatchFrameCosts)
             {
@@ -2977,14 +2963,14 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
                             if (frames[b]->costEst[i][j] >= 0)
                                 continue;
 
-                            estGroup.add(p0, p1, b);
+                            m_fjp->add(frames, p0, p1, b);
                         }
                     }
                 }
 
-                /* auto-disable after the first batch if the pool is not large */
-                m_bBatchFrameCosts &= m_pool->m_numWorkers > 12;
-                estGroup.finishBatch();
+                /* auto-disable after the first batch if the fork-join pool is not large */
+                m_bBatchFrameCosts &= m_fjp->m_numWorkers > 12;
+                m_fjp->finishBatch();
             }
         }
 
@@ -3047,13 +3033,12 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
             }
             else if (m_param->bFrameAdaptive == X265_B_ADAPT_FAST)
             {
-                CostEstimateGroup estGroup(*this, frames);
 
                 int64_t cost1p0, cost2p0, cost1b1, cost2p1;
 
                 for (int i = 0; i <= numFrames - 2; )
                 {
-                    cost2p1 = estGroup.singleCost(i + 0, i + 2, i + 2, true);
+                    cost2p1 = singleCost(*m_fjp, frames, i + 0, i + 2, i + 2, true);
                     if (frames[i + 2]->intraMbs[2] > cuCount / 2)
                     {
                         frames[i + 1]->sliceType = X265_TYPE_P;
@@ -3062,9 +3047,9 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
                         continue;
                     }
 
-                    cost1b1 = estGroup.singleCost(i + 0, i + 2, i + 1);
-                    cost1p0 = estGroup.singleCost(i + 0, i + 1, i + 1);
-                    cost2p0 = estGroup.singleCost(i + 1, i + 2, i + 2);
+                    cost1b1 = singleCost(*m_fjp, frames, i + 0, i + 2, i + 1);
+                    cost1p0 = singleCost(*m_fjp, frames, i + 0, i + 1, i + 1);
+                    cost2p0 = singleCost(*m_fjp, frames, i + 1, i + 2, i + 2);
 
                     if (cost1p0 + cost2p0 < cost1b1 + cost2p1)
                     {
@@ -3082,7 +3067,7 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
                     for (j = i + 2; j <= X265_MIN(i + m_param->bframes, numFrames - 1); j++)
                     {
                         int64_t pthresh = X265_MAX(INTER_THRESH - P_SENS_BIAS * (j - i - 1), INTER_THRESH / 10);
-                        int64_t pcost = estGroup.singleCost(i + 0, j + 1, j + 1, true);
+                        int64_t pcost = singleCost(*m_fjp, frames, i + 0, j + 1, j + 1, true);
                         if (pcost > pthresh * cuCount || frames[j + 1]->intraMbs[j - i + 1] > cuCount / 3)
                             break;
                         frames[j]->sliceType = X265_TYPE_B;
@@ -3282,8 +3267,7 @@ bool Lookahead::scenecutInternal(Lowres **frames, int p0, int p1, bool bRealScen
 {
     Lowres *frame = frames[p1];
 
-    CostEstimateGroup estGroup(*this, frames);
-    estGroup.singleCost(p0, p1, p1);
+    singleCost(*m_fjp, frames, p0, p1, p1);
     int64_t icost = frame->costEst[0][0];
     int64_t pcost = frame->costEst[p1 - p0][0];
     int gopSize = (frame->frameNum - m_lastKeyframe) % m_param->keyframeMax;
@@ -3537,7 +3521,6 @@ int64_t Lookahead::slicetypePathCost(Lowres **frames, char *path, int64_t thresh
     int loc = 1;
     int cur_p = 0;
 
-    CostEstimateGroup estGroup(*this, frames);
 
     path--; /* Since the 1st path element is really the second frame */
     while (path[loc])
@@ -3548,7 +3531,7 @@ int64_t Lookahead::slicetypePathCost(Lowres **frames, char *path, int64_t thresh
             next_p++;
 
         /* Add the cost of the P-frame found above */
-        cost += estGroup.singleCost(cur_p, next_p, next_p);
+        cost += singleCost(*m_fjp, frames, cur_p, next_p, next_p);
 
         /* Early terminate if the cost we have found is larger than the best path cost so far */
         if (cost > threshold)
@@ -3557,18 +3540,18 @@ int64_t Lookahead::slicetypePathCost(Lowres **frames, char *path, int64_t thresh
         if (m_param->bBPyramid && next_p - cur_p > 2)
         {
             int middle = cur_p + (next_p - cur_p) / 2;
-            cost += estGroup.singleCost(cur_p, next_p, middle);
+            cost += singleCost(*m_fjp, frames, cur_p, next_p, middle);
 
             for (int next_b = loc; next_b < middle && cost < threshold; next_b++)
-                cost += estGroup.singleCost(cur_p, middle, next_b);
+                cost += singleCost(*m_fjp, frames, cur_p, middle, next_b);
 
             for (int next_b = middle + 1; next_b < next_p && cost < threshold; next_b++)
-                cost += estGroup.singleCost(middle, next_p, next_b);
+                cost += singleCost(*m_fjp, frames, middle, next_p, next_b);
         }
         else
         {
             for (int next_b = loc; next_b < next_p && cost < threshold; next_b++)
-                cost += estGroup.singleCost(cur_p, next_p, next_b);
+                cost += singleCost(*m_fjp, frames, cur_p, next_p, next_b);
         }
 
         loc = next_p + 1;
@@ -3706,7 +3689,6 @@ void Lookahead::cuTree(Lowres **frames, int numframes, bool bIntra)
         memset(frames[lastnonb]->propagateCost, 0, m_cuCount * sizeof(uint16_t));
     }
 
-    CostEstimateGroup estGroup(*this, frames);
 
     while (i-- > idx)
     {
@@ -3717,14 +3699,14 @@ void Lookahead::cuTree(Lowres **frames, int numframes, bool bIntra)
         if (curnonb < idx)
             break;
 
-        estGroup.singleCost(curnonb, lastnonb, lastnonb);
+        singleCost(*m_fjp, frames, curnonb, lastnonb, lastnonb);
 
         memset(frames[curnonb]->propagateCost, 0, m_cuCount * sizeof(uint16_t));
         bframes = lastnonb - curnonb - 1;
         if (m_param->bBPyramid && bframes > 1)
         {
             int middle = (bframes + 1) / 2 + curnonb;
-            estGroup.singleCost(curnonb, lastnonb, middle);
+            singleCost(*m_fjp, frames, curnonb, lastnonb, middle);
             memset(frames[middle]->propagateCost, 0, m_cuCount * sizeof(uint16_t));
             while (i > curnonb)
             {
@@ -3732,7 +3714,7 @@ void Lookahead::cuTree(Lowres **frames, int numframes, bool bIntra)
                 int p1 = i < middle ? middle : lastnonb;
                 if (i != middle)
                 {
-                    estGroup.singleCost(p0, p1, i);
+                    singleCost(*m_fjp, frames, p0, p1, i);
                     estimateCUPropagate(frames, averageDuration, p0, p1, i, 0);
                 }
                 i--;
@@ -3744,7 +3726,7 @@ void Lookahead::cuTree(Lowres **frames, int numframes, bool bIntra)
         {
             while (i > curnonb)
             {
-                estGroup.singleCost(curnonb, lastnonb, i);
+                singleCost(*m_fjp, frames, curnonb, lastnonb, i);
                 estimateCUPropagate(frames, averageDuration, curnonb, lastnonb, i, 0);
                 i--;
             }
@@ -3755,7 +3737,7 @@ void Lookahead::cuTree(Lowres **frames, int numframes, bool bIntra)
 
     if (!m_param->lookaheadDepth)
     {
-        estGroup.singleCost(0, lastnonb, lastnonb);
+        singleCost(*m_fjp, frames, 0, lastnonb, lastnonb);
         estimateCUPropagate(frames, averageDuration, 0, lastnonb, lastnonb, 1);
         std::swap(frames[lastnonb]->propagateCost, frames[0]->propagateCost);
     }
@@ -4145,253 +4127,37 @@ int64_t Lookahead::frameCostRecalculate(Lowres** frames, int p0, int p1, int b)
 }
 
 
-int64_t CostEstimateGroup::singleCost(int p0, int p1, int b, bool intraPenalty)
+/* Per-slice accumulator for cooperative frame cost estimation; lives on the
+ * estimateFrameCost coroutine frame, one per forked slice */
+struct CoopSliceResult
 {
-    LookaheadTLD& tld = m_lookahead.m_tld[m_lookahead.m_pool ? m_lookahead.m_pool->m_numWorkers : 0];
-    return estimateFrameCost(tld, p0, p1, b, intraPenalty);
-}
+    int costEst;
+    int costEstAq;
+    int intraMbs;
+};
 
-void CostEstimateGroup::add(int p0, int p1, int b)
+/* Leaf coroutine: single lowres CU cost estimate. Sequenced with lf::call from
+ * the slice/frame loops (reverse-raster MV prediction forbids intra-slice
+ * parallelism). Writes to `acc` when in cooperative slice mode, or directly to
+ * fenc when `acc` is NULL */
+static constexpr auto estimateCUCostAsync =
+    [](auto, LookaheadTLD* tldp, Lookahead* la, Lowres** frames,
+       int cuX, int cuY, int p0, int p1, int b,
+       bool doSearch0, bool doSearch1, bool lastRow,
+       CoopSliceResult* acc, bool hme) -> lf::task<>
 {
-    X265_CHECK(m_batchMode || !m_jobTotal, "single CostEstimateGroup instance cannot mix batch modes\n");
-    m_batchMode = true;
+    constexpr int s_merange = 16;
+    LookaheadTLD& tld = *tldp;
+    bool bDoSearch[2] = { doSearch0, doSearch1 };
 
-    Estimate& e = m_estimates[m_jobTotal++];
-    e.p0       = p0;
-    e.p1       = p1;
-    e.b        = b;
-    e.blockRow = -1;
-    e.MElevel  = -1;
-    e.frame    = NULL;
-
-    if (m_jobTotal == MAX_BATCH_SIZE)
-        finishBatch();
-}
-
-void CostEstimateGroup::addRow(int refIdx, int poc, int curPoc, int blockRow, int level, Frame* frame)
-{
-    X265_CHECK(m_batchMode || !m_jobTotal,
-               "single CostEstimateGroup instance cannot mix batch modes\n");
-    m_batchMode = true;
-
-    Estimate& e  = m_estimates[m_jobTotal++];
-    e.p0         = refIdx;
-    e.p1         = poc;
-    e.b          = curPoc;
-    e.blockRow   = blockRow;
-    e.MElevel    = level;
-    e.frame      = frame;
-
-    if (m_jobTotal == MAX_BATCH_SIZE)
-        finishBatch();
-}
-
-void CostEstimateGroup::finishBatch()
-{
-    if (m_lookahead.m_pool)
-        tryBondPeers(*m_lookahead.m_pool, m_jobTotal);
-    processTasks(-1);
-    waitForExit();
-    m_jobTotal = m_jobAcquired = 0;
-}
-
-void CostEstimateGroup::processTasks(int workerThreadID)
-{
-    ThreadPool* pool = m_lookahead.m_pool;
-    int id = workerThreadID;
-    if (workerThreadID < 0)
-        id = pool ? pool->m_numWorkers : 0;
-    LookaheadTLD& tld = m_lookahead.m_tld[id];
-
-    m_lock.acquire();
-    while (m_jobAcquired < m_jobTotal)
-    {
-        int i = m_jobAcquired++;
-        m_lock.release();
-
-        if (m_batchMode)
-        {
-            ProfileScopeEvent(estCostSingle);
-            Estimate& e = m_estimates[i];
-            Frame* curFrame = e.frame;
-            if (m_lookahead.m_param->bEnableTemporalFilter && curFrame && m_lookahead.isFilterThisframe(curFrame->m_mcstf->m_sliceTypeConfig, curFrame->m_lowres.sliceType))
-            {
-                ProfileLookaheadTime(tld.mcstfBatchElapsedTime);
-                MotionEstimatorTLD& m_metld = m_lookahead.m_metld[id];
-
-                m_metld.m_bitDepth = curFrame->m_param->internalBitDepth;
-                TemporalFilterRefPicInfo* ref = &curFrame->m_mcstfRefList[e.p0];
-                Lowres *lowres = &curFrame->m_lowres;
-                const int rowSize = PARALLEL_ME_ROWSIZE;
-                if (e.MElevel == 0)
-                    m_metld.motionEstimationLuma(ref->mvs0, ref->mvsStride0, lowres->lowerResPlane[0], (int)(lowres->lumaStride / 2), (lowres->lines / 2), (lowres->width / 2), ref->lowerRes, e.blockRow, rowSize);
-                else if (e.MElevel == 1)
-                    m_metld.motionEstimationLuma(ref->mvs1, ref->mvsStride1, lowres->lowresPlane[0], (int)(lowres->lumaStride), (lowres->lines), (lowres->width), ref->lowres, e.blockRow, rowSize, ref->mvs0, ref->mvsStride0, 2);
-                else if (e.MElevel == 2)
-                    m_metld.motionEstimationLuma(ref->mvs2, ref->mvsStride2, curFrame->m_fencPic->m_picOrg[0], (int)curFrame->m_fencPic->m_stride, curFrame->m_fencPic->m_picHeight, curFrame->m_fencPic->m_picWidth, ref->picBuffer->m_picOrg[0], e.blockRow, rowSize, ref->mvs1, ref->mvsStride1, 2);
-                else if (e.MElevel == 3)
-                    m_metld.motionEstimationLumaDoubleRes(ref->mvs, ref->mvsStride, curFrame->m_fencPic, ref->picBuffer, ref->mvs2, ref->mvsStride2, 1, ref->error, e.blockRow, rowSize);
-            }
-            else
-            {
-                ProfileLookaheadTime(tld.framecostBatchElapsedTime);
-                estimateFrameCost(tld, e.p0, e.p1, e.b, false);
-            }
-        }
-        else
-        {
-            ProfileLookaheadTime(tld.coopSliceElapsedTime);
-            ProfileScopeEvent(estCostCoop);
-
-            X265_CHECK(i < MAX_COOP_SLICES, "impossible number of coop slices\n");
-
-            int firstY, lastY;
-            bool lastRow;
-            if (m_lookahead.m_param->bEnableHME)
-            {
-                int numRowsPerSlice = m_lookahead.m_4x4Height / m_lookahead.m_param->lookaheadSlices;
-                numRowsPerSlice = X265_MIN(X265_MAX(numRowsPerSlice, 5), m_lookahead.m_4x4Height);
-                firstY = numRowsPerSlice * i;
-                lastY = (i == m_jobTotal - 1) ? m_lookahead.m_4x4Height - 1 : numRowsPerSlice * (i + 1) - 1;
-                lastRow = true;
-                for (int cuY = lastY; cuY >= firstY; cuY--)
-                {
-                    for (int cuX = m_lookahead.m_4x4Width - 1; cuX >= 0; cuX--)
-                        estimateCUCost(tld, cuX, cuY, m_coop.p0, m_coop.p1, m_coop.b, m_coop.bDoSearch, lastRow, i, 1);
-                    lastRow = false;
-                }
-            }
-
-            firstY = m_lookahead.m_numRowsPerSlice * i;
-            lastY = (i == m_jobTotal - 1) ? m_lookahead.m_8x8Height - 1 : m_lookahead.m_numRowsPerSlice * (i + 1) - 1;
-            lastRow = true;
-            for (int cuY = lastY; cuY >= firstY; cuY--)
-            {
-                m_frames[m_coop.b]->rowSatds[m_coop.b - m_coop.p0][m_coop.p1 - m_coop.b][cuY] = 0;
-
-                for (int cuX = m_lookahead.m_8x8Width - 1; cuX >= 0; cuX--)
-                    estimateCUCost(tld, cuX, cuY, m_coop.p0, m_coop.p1, m_coop.b, m_coop.bDoSearch, lastRow, i, 0);
-
-                lastRow = false;
-            }
-        }
-
-        m_lock.acquire();
-    }
-    m_lock.release();
-}
-
-int64_t CostEstimateGroup::estimateFrameCost(LookaheadTLD& tld, int p0, int p1, int b, bool bIntraPenalty)
-{
-    Lowres*     fenc  = m_frames[b];
-    x265_param* param = m_lookahead.m_param;
-    int64_t     score = 0;
-
-    if (fenc->costEst[b - p0][p1 - b] >= 0 && fenc->rowSatds[b - p0][p1 - b][0] != -1)
-        score = fenc->costEst[b - p0][p1 - b];
-    else
-    {
-        bool bDoSearch[2];
-        bDoSearch[0] = fenc->lowresMvs[0][b - p0][0].x == 0x7FFF;
-        bDoSearch[1] = p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFF;
-
-#if CHECKED_BUILD
-        X265_CHECK(!(p0 < b && fenc->lowresMvs[0][b - p0][0].x == 0x7FFE), "motion search batch duplication L0\n");
-        X265_CHECK(!(p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFE), "motion search batch duplication L1\n");
-        if (bDoSearch[0]) fenc->lowresMvs[0][b - p0][0].x = 0x7FFE;
-        if (bDoSearch[1]) fenc->lowresMvs[1][p1 - b][0].x = 0x7FFE;
-#endif
-
-        fenc->weightedRef[b - p0].isWeighted = false;
-        if (param->bEnableWeightedPred && bDoSearch[0])
-            tld.weightsAnalyse(*m_frames[b], *m_frames[p0]);
-
-        fenc->costEst[b - p0][p1 - b] = 0;
-        fenc->costEstAq[b - p0][p1 - b] = 0;
-
-        if (!m_batchMode && m_lookahead.m_numCoopSlices > 1 && ((p1 > b) || bDoSearch[0] || bDoSearch[1]))
-        {
-            /* Use cooperative mode if a thread pool is available and the cost estimate is
-             * going to need motion searches or bidir measurements */
-
-            memset(&m_slice, 0, sizeof(Slice) * m_lookahead.m_numCoopSlices);
-
-            m_lock.acquire();
-            X265_CHECK(!m_batchMode, "single CostEstimateGroup instance cannot mix batch modes\n");
-            m_coop.p0 = p0;
-            m_coop.p1 = p1;
-            m_coop.b = b;
-            m_coop.bDoSearch[0] = bDoSearch[0];
-            m_coop.bDoSearch[1] = bDoSearch[1];
-            m_jobTotal = m_lookahead.m_numCoopSlices;
-            m_jobAcquired = 0;
-            m_lock.release();
-
-            tryBondPeers(*m_lookahead.m_pool, m_jobTotal);
-
-            processTasks(-1);
-
-            waitForExit();
-
-            for (int i = 0; i < m_lookahead.m_numCoopSlices; i++)
-            {
-                fenc->costEst[b - p0][p1 - b] += m_slice[i].costEst;
-                fenc->costEstAq[b - p0][p1 - b] += m_slice[i].costEstAq;
-                if (p1 == b)
-                    fenc->intraMbs[b - p0] += m_slice[i].intraMbs;
-            }
-        }
-        else
-        {
-            /* Calculate MVs for 1/16th resolution*/
-            bool lastRow;
-            if (param->bEnableHME)
-            {
-                lastRow = true;
-                for (int cuY = m_lookahead.m_4x4Height - 1; cuY >= 0; cuY--)
-                {
-                    for (int cuX = m_lookahead.m_4x4Width - 1; cuX >= 0; cuX--)
-                        estimateCUCost(tld, cuX, cuY, p0, p1, b, bDoSearch, lastRow, -1, 1);
-                    lastRow = false;
-                }
-            }
-            lastRow = true;
-            for (int cuY = m_lookahead.m_8x8Height - 1; cuY >= 0; cuY--)
-            {
-                fenc->rowSatds[b - p0][p1 - b][cuY] = 0;
-
-                for (int cuX = m_lookahead.m_8x8Width - 1; cuX >= 0; cuX--)
-                    estimateCUCost(tld, cuX, cuY, p0, p1, b, bDoSearch, lastRow, -1, 0);
-
-                lastRow = false;
-            }
-        }
-
-        score = fenc->costEst[b - p0][p1 - b];
-
-        if (b != p1)
-            score = score * 100 / (130 + param->bFrameBias);
-
-        fenc->costEst[b - p0][p1 - b] = score;
-    }
-
-    if (bIntraPenalty)
-        // arbitrary penalty for I-blocks after B-frames
-        score += score * fenc->intraMbs[b - p0] / (tld.ncu * 8);
-
-    return score;
-}
-
-void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int p0, int p1, int b, bool bDoSearch[2], bool lastRow, int slice, bool hme)
-{
-    Lowres *fref0 = m_frames[p0];
-    Lowres *fref1 = m_frames[p1];
-    Lowres *fenc  = m_frames[b];
+    Lowres *fref0 = frames[p0];
+    Lowres *fref1 = frames[p1];
+    Lowres *fenc  = frames[b];
 
     ReferencePlanes *wfref0 = (bool)fenc->weightedRef[b - p0].isWeighted && !hme ? &fenc->weightedRef[b - p0] : fref0;
 
-    const int widthInCU = hme ? m_lookahead.m_4x4Width : m_lookahead.m_8x8Width;
-    const int heightInCU = hme ? m_lookahead.m_4x4Height : m_lookahead.m_8x8Height;
+    const int widthInCU = hme ? la->m_4x4Width : la->m_8x8Width;
+    const int heightInCU = hme ? la->m_4x4Height : la->m_8x8Height;
     const int bBidir = (b < p1);
     const int cuXY = cuX + cuY * widthInCU;
     const int cuXY_4x4 = (cuX / 2) + (cuY / 2) * widthInCU / 2;
@@ -4399,9 +4165,9 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
     const intptr_t pelOffset = cuSize * cuX + cuSize * cuY * (hme ? fenc->lumaStride/2 : fenc->lumaStride);
 
     if ((bBidir || bDoSearch[0] || bDoSearch[1]) && hme)
-        tld.me.setSourcePU(fenc->lowerResPlane[0], fenc->lumaStride / 2, pelOffset, cuSize, cuSize, X265_HEX_SEARCH, m_lookahead.m_param->hmeSearchMethod[0], m_lookahead.m_param->hmeSearchMethod[1], 1);
+        tld.me.setSourcePU(fenc->lowerResPlane[0], fenc->lumaStride / 2, pelOffset, cuSize, cuSize, X265_HEX_SEARCH, la->m_param->hmeSearchMethod[0], la->m_param->hmeSearchMethod[1], 1);
     else if((bBidir || bDoSearch[0] || bDoSearch[1]) && !hme)
-        tld.me.setSourcePU(fenc->lowresPlane[0], fenc->lumaStride, pelOffset, cuSize, cuSize, X265_HEX_SEARCH, m_lookahead.m_param->hmeSearchMethod[0], m_lookahead.m_param->hmeSearchMethod[1], 1);
+        tld.me.setSourcePU(fenc->lowresPlane[0], fenc->lumaStride, pelOffset, cuSize, cuSize, X265_HEX_SEARCH, la->m_param->hmeSearchMethod[0], la->m_param->hmeSearchMethod[1], 1);
 
 
     /* A small, arbitrary bias to avoid VBV problems caused by zero-residual lookahead blocks. */
@@ -4457,7 +4223,7 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
             mvp = 0;
         else
         {
-            ALIGN_VAR_32(pixel, subpelbuf[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
+            pixel* subpelbuf = tld.subpelbuf0;
             int mvpcost = MotionEstimate::COST_MAX;
 
             /* measure SATD cost of each neighbor MV (estimating merge analysis)
@@ -4475,13 +4241,13 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
             }
         }
 
-        int searchRange = m_lookahead.m_param->bEnableHME ? (hme ? m_lookahead.m_param->hmeRange[0] : m_lookahead.m_param->hmeRange[1]) : s_merange;
+        int searchRange = la->m_param->bEnableHME ? (hme ? la->m_param->hmeRange[0] : la->m_param->hmeRange[1]) : s_merange;
         /* ME will never return a cost larger than the cost @MVP, so we do not
          * have to check that ME cost is more than the estimated merge cost */
         if(!hme)
-            fencCost = tld.me.motionEstimate(fref, mvmin, mvmax, mvp, 0, NULL, searchRange, *fencMV, m_lookahead.m_param->maxSlices, 0);
+            fencCost = tld.me.motionEstimate(fref, mvmin, mvmax, mvp, 0, NULL, searchRange, *fencMV, la->m_param->maxSlices, 0);
         else
-            fencCost = tld.me.motionEstimate(fref, mvmin, mvmax, mvp, 0, NULL, searchRange, *fencMV, m_lookahead.m_param->maxSlices, 0, fref->lowerResPlane[0]);
+            fencCost = tld.me.motionEstimate(fref, mvmin, mvmax, mvp, 0, NULL, searchRange, *fencMV, la->m_param->maxSlices, 0, fref->lowerResPlane[0]);
         if (skipCost < 64 && skipCost < fencCost && bBidir)
         {
             fencCost = skipCost;
@@ -4490,19 +4256,19 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
         COPY2_IF_LT(bcost, fencCost, listused, i + 1);
     }
     if (hme)
-        return;
+        co_return;
 
     if (bBidir) /* B, also consider bidir */
     {
         /* NOTE: the wfref0 (weightp) is not used for BIDIR */
 
         /* avg(l0-mv, l1-mv) candidate */
-        ALIGN_VAR_32(pixel, subpelbuf0[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
-        ALIGN_VAR_32(pixel, subpelbuf1[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
+        pixel* subpelbuf0 = tld.subpelbuf0;
+        pixel* subpelbuf1 = tld.subpelbuf1;
         intptr_t stride0 = X265_LOWRES_CU_SIZE, stride1 = X265_LOWRES_CU_SIZE;
         pixel *src0 = fref0->lowresMC(pelOffset, fenc->lowresMvs[0][listDist[0]][cuXY], subpelbuf0, stride0, 0);
         pixel *src1 = fref1->lowresMC(pelOffset, fenc->lowresMvs[1][listDist[1]][cuXY], subpelbuf1, stride1, 0);
-        ALIGN_VAR_32(pixel, ref[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
+        pixel* ref = tld.avgbuf;
         primitives.pu[LUMA_8x8].pixelavg_pp[NONALIGNED](ref, X265_LOWRES_CU_SIZE, src0, stride0, src1, stride1, 32);
         int bicost = tld.me.bufSATD(ref, X265_LOWRES_CU_SIZE);
         COPY2_IF_LT(bcost, bicost, listused, 3);
@@ -4529,14 +4295,14 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
     const bool bFrameScoreCU = (cuX > 0 && cuX < widthInCU - 1 &&
                                 cuY > 0 && cuY < heightInCU - 1) || widthInCU <= 2 || heightInCU <= 2;
     int bcostAq;
-    if (m_lookahead.m_param->rc.qgSize == 8)
+    if (la->m_param->rc.qgSize == 8)
         bcostAq = (bFrameScoreCU && fenc->invQscaleFactor) ? ((bcost * fenc->invQscaleFactor8x8[cuXY] + 128) >> 8) : bcost;
     else
         bcostAq = (bFrameScoreCU && fenc->invQscaleFactor) ? ((bcost * fenc->invQscaleFactor[cuXY] +128) >> 8) : bcost;
 
     if (bFrameScoreCU)
     {
-        if (slice < 0)
+        if (!acc)
         {
             fenc->costEst[b - p0][p1 - b] += bcost;
             fenc->costEstAq[b - p0][p1 - b] += bcostAq;
@@ -4545,15 +4311,288 @@ void CostEstimateGroup::estimateCUCost(LookaheadTLD& tld, int cuX, int cuY, int 
         }
         else
         {
-            m_slice[slice].costEst += bcost;
-            m_slice[slice].costEstAq += bcostAq;
+            acc->costEst += bcost;
+            acc->costEstAq += bcostAq;
             if (!listused && !bBidir)
-                m_slice[slice].intraMbs++;
+                acc->intraMbs++;
         }
     }
 
     fenc->rowSatds[b - p0][p1 - b][cuY] += bcostAq;
     fenc->lowresCosts[b - p0][p1 - b][cuXY] = (uint16_t)(X265_MIN(bcost, LOWRES_COST_MASK) | (listused << LOWRES_COST_SHIFT));
+    co_return;
+};
+
+/* One cooperative slice of a frame cost estimate. Acquires its own TLD from
+ * the pool arena and walks its band of CU rows bottom-up */
+static constexpr auto coopSliceAsync =
+    [](auto, ForkJoinPool* fjp, Lowres** frames, int slice, int numSlices,
+       int p0, int p1, int b, bool doSearch0, bool doSearch1,
+       CoopSliceResult* acc) -> lf::task<>
+{
+    Lookahead* la = &fjp->m_lookahead;
+    ScopedTLD scoped(fjp->m_arena);
+    LookaheadTLD& tld = scoped.tld();
+
+    ProfileLookaheadTime(tld.coopSliceElapsedTime);
+    ProfileScopeEvent(estCostCoop);
+
+    int firstY, lastY;
+    bool lastRow;
+    if (la->m_param->bEnableHME)
+    {
+        int numRowsPerSlice = la->m_4x4Height / la->m_param->lookaheadSlices;
+        numRowsPerSlice = X265_MIN(X265_MAX(numRowsPerSlice, 5), la->m_4x4Height);
+        firstY = numRowsPerSlice * slice;
+        lastY = (slice == numSlices - 1) ? la->m_4x4Height - 1 : numRowsPerSlice * (slice + 1) - 1;
+        lastRow = true;
+        for (int cuY = lastY; cuY >= firstY; cuY--)
+        {
+            for (int cuX = la->m_4x4Width - 1; cuX >= 0; cuX--)
+                co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, doSearch0, doSearch1, lastRow, acc, true);
+            lastRow = false;
+        }
+    }
+
+    firstY = la->m_numRowsPerSlice * slice;
+    lastY = (slice == numSlices - 1) ? la->m_8x8Height - 1 : la->m_numRowsPerSlice * (slice + 1) - 1;
+    lastRow = true;
+    for (int cuY = lastY; cuY >= firstY; cuY--)
+    {
+        frames[b]->rowSatds[b - p0][p1 - b][cuY] = 0;
+
+        for (int cuX = la->m_8x8Width - 1; cuX >= 0; cuX--)
+            co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, doSearch0, doSearch1, lastRow, acc, false);
+
+        lastRow = false;
+    }
+    co_return;
+};
+
+/* Frame cost estimate coroutine. Forks one coopSliceAsync per slice whenever
+ * coop slices are configured and new searches are needed - including from
+ * batch mode, which under BondedTaskGroup was forbidden from doing so because
+ * the slice accumulators were shared group state; they now live on this
+ * coroutine's frame */
+static constexpr auto estimateFrameCostAsync =
+    [](auto, ForkJoinPool* fjp, Lowres** frames, int p0, int p1, int b,
+       bool bIntraPenalty) -> lf::task<int64_t>
+{
+    Lookahead* la = &fjp->m_lookahead;
+    Lowres*     fenc  = frames[b];
+    x265_param* param = la->m_param;
+    int64_t     score = 0;
+
+    if (fenc->costEst[b - p0][p1 - b] >= 0 && fenc->rowSatds[b - p0][p1 - b][0] != -1)
+        score = fenc->costEst[b - p0][p1 - b];
+    else
+    {
+        bool bDoSearch[2];
+        bDoSearch[0] = fenc->lowresMvs[0][b - p0][0].x == 0x7FFF;
+        bDoSearch[1] = p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFF;
+
+#if CHECKED_BUILD
+        X265_CHECK(!(p0 < b && fenc->lowresMvs[0][b - p0][0].x == 0x7FFE), "motion search batch duplication L0\n");
+        X265_CHECK(!(p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFE), "motion search batch duplication L1\n");
+        if (bDoSearch[0]) fenc->lowresMvs[0][b - p0][0].x = 0x7FFE;
+        if (bDoSearch[1]) fenc->lowresMvs[1][p1 - b][0].x = 0x7FFE;
+#endif
+
+        /* The weighted reference planes generated here point into this TLD's
+         * wbuffer, so the slot must stay acquired until estimation completes
+         * (coop slice workers read them through fenc->weightedRef) */
+        ScopedTLD scoped(fjp->m_arena);
+        LookaheadTLD& tld = scoped.tld();
+
+        fenc->weightedRef[b - p0].isWeighted = false;
+        if (param->bEnableWeightedPred && bDoSearch[0])
+            tld.weightsAnalyse(*frames[b], *frames[p0]);
+
+        fenc->costEst[b - p0][p1 - b] = 0;
+        fenc->costEstAq[b - p0][p1 - b] = 0;
+
+        if (la->m_numCoopSlices > 1 && ((p1 > b) || bDoSearch[0] || bDoSearch[1]))
+        {
+            /* Use cooperative mode if the cost estimate is going to need
+             * motion searches or bidir measurements */
+            const int numSlices = la->m_numCoopSlices;
+            X265_CHECK(numSlices <= ForkJoinPool::MAX_COOP_SLICES, "impossible number of coop slices\n");
+
+            CoopSliceResult results[ForkJoinPool::MAX_COOP_SLICES] = {};
+
+            for (int i = 0; i < numSlices - 1; i++)
+                co_await lf::fork[coopSliceAsync](fjp, frames, i, numSlices, p0, p1, b, bDoSearch[0], bDoSearch[1], &results[i]);
+            co_await lf::call[coopSliceAsync](fjp, frames, numSlices - 1, numSlices, p0, p1, b, bDoSearch[0], bDoSearch[1], &results[numSlices - 1]);
+            co_await lf::join;
+
+            for (int i = 0; i < numSlices; i++)
+            {
+                fenc->costEst[b - p0][p1 - b] += results[i].costEst;
+                fenc->costEstAq[b - p0][p1 - b] += results[i].costEstAq;
+                if (p1 == b)
+                    fenc->intraMbs[b - p0] += results[i].intraMbs;
+            }
+        }
+        else
+        {
+            ProfileLookaheadTime(tld.framecostBatchElapsedTime);
+
+            /* Calculate MVs for 1/16th resolution*/
+            bool lastRow;
+            if (param->bEnableHME)
+            {
+                lastRow = true;
+                for (int cuY = la->m_4x4Height - 1; cuY >= 0; cuY--)
+                {
+                    for (int cuX = la->m_4x4Width - 1; cuX >= 0; cuX--)
+                        co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, bDoSearch[0], bDoSearch[1], lastRow, (CoopSliceResult*)NULL, true);
+                    lastRow = false;
+                }
+            }
+            lastRow = true;
+            for (int cuY = la->m_8x8Height - 1; cuY >= 0; cuY--)
+            {
+                fenc->rowSatds[b - p0][p1 - b][cuY] = 0;
+
+                for (int cuX = la->m_8x8Width - 1; cuX >= 0; cuX--)
+                    co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, bDoSearch[0], bDoSearch[1], lastRow, (CoopSliceResult*)NULL, false);
+
+                lastRow = false;
+            }
+        }
+
+        score = fenc->costEst[b - p0][p1 - b];
+
+        if (b != p1)
+            score = score * 100 / (130 + param->bFrameBias);
+
+        fenc->costEst[b - p0][p1 - b] = score;
+    }
+
+    if (bIntraPenalty)
+        // arbitrary penalty for I-blocks after B-frames
+        score += score * fenc->intraMbs[b - p0] / (la->m_8x8Blocks * 8);
+
+    co_return score;
+};
+
+/* Root coroutine for a batch of frame cost estimates; each child may fork its
+ * own coop slices */
+static constexpr auto costBatchAsync =
+    [](auto, ForkJoinPool* fjp, Lowres** frames,
+       const ForkJoinPool::Estimate* est, int n) -> lf::task<>
+{
+    int64_t scores[ForkJoinPool::MAX_BATCH_SIZE];
+
+    for (int i = 0; i < n - 1; i++)
+        co_await lf::fork[&scores[i], estimateFrameCostAsync](fjp, frames, est[i].p0, est[i].p1, est[i].b, false);
+    co_await lf::call[&scores[n - 1], estimateFrameCostAsync](fjp, frames, est[n - 1].p0, est[n - 1].p1, est[n - 1].b, false);
+    co_await lf::join;
+    co_return;
+};
+
+/* MCSTF motion search for one (reference, block row, pyramid level) unit;
+ * fully decoupled from the frame cost estimate path */
+static constexpr auto mcstfRowAsync =
+    [](auto, ForkJoinPool* fjp, Frame* curFrame, int refIdx, int blockRow,
+       int level) -> lf::task<>
+{
+    ScopedTLD scoped(fjp->m_arena);
+    ProfileLookaheadTime(scoped.tld().mcstfBatchElapsedTime);
+    MotionEstimatorTLD& metld = scoped.metld();
+
+    metld.m_bitDepth = curFrame->m_param->internalBitDepth;
+    TemporalFilterRefPicInfo* ref = &curFrame->m_mcstfRefList[refIdx];
+    Lowres *lowres = &curFrame->m_lowres;
+    const int rowSize = PARALLEL_ME_ROWSIZE;
+    if (level == 0)
+        metld.motionEstimationLuma(ref->mvs0, ref->mvsStride0, lowres->lowerResPlane[0], (int)(lowres->lumaStride / 2), (lowres->lines / 2), (lowres->width / 2), ref->lowerRes, blockRow, rowSize);
+    else if (level == 1)
+        metld.motionEstimationLuma(ref->mvs1, ref->mvsStride1, lowres->lowresPlane[0], (int)(lowres->lumaStride), (lowres->lines), (lowres->width), ref->lowres, blockRow, rowSize, ref->mvs0, ref->mvsStride0, 2);
+    else if (level == 2)
+        metld.motionEstimationLuma(ref->mvs2, ref->mvsStride2, curFrame->m_fencPic->m_picOrg[0], (int)curFrame->m_fencPic->m_stride, curFrame->m_fencPic->m_picHeight, curFrame->m_fencPic->m_picWidth, ref->picBuffer->m_picOrg[0], blockRow, rowSize, ref->mvs1, ref->mvsStride1, 2);
+    else if (level == 3)
+        metld.motionEstimationLumaDoubleRes(ref->mvs, ref->mvsStride, curFrame->m_fencPic, ref->picBuffer, ref->mvs2, ref->mvsStride2, 1, ref->error, blockRow, rowSize);
+    co_return;
+};
+
+static constexpr auto mcstfBatchAsync =
+    [](auto, ForkJoinPool* fjp, const ForkJoinPool::McstfTask* tasks,
+       int n) -> lf::task<>
+{
+    for (int i = 0; i < n - 1; i++)
+        co_await lf::fork[mcstfRowAsync](fjp, tasks[i].frame, tasks[i].refIdx, tasks[i].blockRow, tasks[i].level);
+    co_await lf::call[mcstfRowAsync](fjp, tasks[n - 1].frame, tasks[n - 1].refIdx, tasks[n - 1].blockRow, tasks[n - 1].level);
+    co_await lf::join;
+    co_return;
+};
+
+int ForkJoinPool::workerCount(const x265_param* param)
+{
+    int workers = param->lookaheadThreads > 0 ? param->lookaheadThreads :
+                  (int)std::thread::hardware_concurrency() / 4;
+    return X265_MAX(1, workers);
+}
+
+ForkJoinPool::ForkJoinPool(Lookahead& lookahead)
+    : m_lookahead(lookahead)
+    , m_numWorkers(workerCount(lookahead.m_param))
+    , m_lf_pool((unsigned)workerCount(lookahead.m_param))
+    , m_batchSize(0)
+    , m_batchFrames(NULL)
+    , m_mcstfSize(0)
+{
+    /* Only started tasks hold arena slots. Workers execute one leaf at a time,
+     * but a worker suspended at a join (its parent holding a slot for the
+     * weighted reference planes) can steal and start further estimates, so
+     * allow a nesting margin beyond one slot per worker */
+    m_arena.init(m_numWorkers * 4 + 4, lookahead.m_8x8Width, lookahead.m_8x8Height, lookahead.m_8x8Blocks);
+}
+
+int64_t singleCost(ForkJoinPool& fjp, Lowres** frames, int p0, int p1, int b, bool intraPenalty)
+{
+    return lf::sync_wait(fjp.m_lf_pool, estimateFrameCostAsync, &fjp, frames, p0, p1, b, intraPenalty);
+}
+
+void ForkJoinPool::add(Lowres** frames, int p0, int p1, int b)
+{
+    X265_CHECK(!m_batchFrames || m_batchFrames == frames, "one batch may not span multiple frame contexts\n");
+    m_batchFrames = frames;
+
+    Estimate& e = m_estimates[m_batchSize++];
+    e.p0 = p0;
+    e.p1 = p1;
+    e.b  = b;
+
+    if (m_batchSize == MAX_BATCH_SIZE)
+        finishBatch();
+}
+
+void ForkJoinPool::finishBatch()
+{
+    if (m_batchSize)
+        lf::sync_wait(m_lf_pool, costBatchAsync, this, m_batchFrames, m_estimates, m_batchSize);
+    m_batchSize = 0;
+    m_batchFrames = NULL;
+}
+
+void ForkJoinPool::addMcstfRow(int refIdx, int blockRow, int level, Frame* frame)
+{
+    McstfTask& t = m_mcstfTasks[m_mcstfSize++];
+    t.refIdx   = refIdx;
+    t.blockRow = blockRow;
+    t.level    = level;
+    t.frame    = frame;
+
+    if (m_mcstfSize == MAX_BATCH_SIZE)
+        finishMcstfBatch();
+}
+
+void ForkJoinPool::finishMcstfBatch()
+{
+    if (m_mcstfSize)
+        lf::sync_wait(m_lf_pool, mcstfBatchAsync, this, m_mcstfTasks, m_mcstfSize);
+    m_mcstfSize = 0;
 }
 
 }

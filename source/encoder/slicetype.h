@@ -32,12 +32,17 @@
 #include "threadpool.h"
 #include "temporalfilter.h"
 
+#include <libfork.hpp>
+#include <libfork/schedule/lazy_pool.hpp>
+#include <thread>
+
 namespace X265_NS {
 // private namespace
 
 struct Lowres;
 class Frame;
 class Lookahead;
+class ForkJoinPool;
 
 #define LOWRES_COST_MASK  ((1 << 14) - 1)
 #define LOWRES_COST_SHIFT 14
@@ -82,6 +87,13 @@ struct LookaheadTLD
     int             heightInCU;
     int             ncu;
     int             paddedLines;
+
+    /* Aligned scratch for estimateCUCost(); lives here rather than on the
+     * coroutine frame because coroutine frames do not guarantee over-aligned
+     * locals */
+    ALIGN_VAR_32(pixel, subpelbuf0[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
+    ALIGN_VAR_32(pixel, subpelbuf1[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
+    ALIGN_VAR_32(pixel, avgbuf[X265_LOWRES_CU_SIZE * X265_LOWRES_CU_SIZE]);
 
 #if DETAILED_CU_STATS
     int64_t         framecostBatchElapsedTime;
@@ -209,7 +221,7 @@ public:
     int8_t                  m_gopId;
 
     OrigPicBuffer*          m_origPicBuf;
-    MotionEstimatorTLD*     m_metld;
+    ForkJoinPool*           m_fjp;
 
     Lookahead(x265_param *param, ThreadPool *pool);
 #if DETAILED_CU_STATS
@@ -291,58 +303,149 @@ protected:
     PreLookaheadGroup& operator=(const PreLookaheadGroup&);
 };
 
-class CostEstimateGroup : public BondedTaskGroup
+struct LookaheadSlot
+{
+    LookaheadTLD tld;
+    MotionEstimatorTLD metld;
+    LookaheadSlot* next;   // free-list link
+};
+
+class TLDFreeList
+{
+public:
+    void init(int n, int w, int h, int blocks)
+    {
+        m_width = w; m_height = h; m_blocks = blocks;
+        m_slots = new LookaheadSlot[n];
+        for (int i = 0; i < n; i++)
+        {
+            m_slots[i].tld.init(w, h, blocks);
+            m_slots[i].next = (i + 1 < n) ? &m_slots[i + 1] : nullptr;
+        }
+        m_free.store(&m_slots[0], std::memory_order_relaxed);
+        m_count = n;
+    }
+    ~TLDFreeList() { delete[] m_slots; }
+
+    /* May return NULL when deep work-stealing chains exceed the arena size;
+     * callers fall back to a heap-allocated slot (see ScopedTLD). A spinlock
+     * guards the free list: a naive CAS stack is ABA-prone here, and the lock
+     * is uncontended relative to the slice/frame-estimate task granularity */
+    LookaheadSlot* acquire()
+    {
+        while (m_lock.test_and_set(std::memory_order_acquire))
+            ;
+        LookaheadSlot* head = m_free.load(std::memory_order_relaxed);
+        if (head)
+            m_free.store(head->next, std::memory_order_relaxed);
+        m_lock.clear(std::memory_order_release);
+        return head;
+    }
+
+    LookaheadSlot* newSlot() const
+    {
+        LookaheadSlot* s = new LookaheadSlot;
+        s->tld.init(m_width, m_height, m_blocks);
+        s->next = nullptr;
+        return s;
+    }
+
+    void release(LookaheadSlot* s)
+    {
+        while (m_lock.test_and_set(std::memory_order_acquire))
+            ;
+        s->next = m_free.load(std::memory_order_relaxed);
+        m_free.store(s, std::memory_order_relaxed);
+        m_lock.clear(std::memory_order_release);
+    }
+
+    LookaheadSlot* m_slots = nullptr;
+    std::atomic<LookaheadSlot*> m_free{nullptr};
+    std::atomic_flag m_lock = ATOMIC_FLAG_INIT;
+    int m_count = 0;
+    int m_width = 0, m_height = 0, m_blocks = 0;
+};
+
+struct ScopedTLD   // RAII, put at top of every leaf task body
+{
+    ScopedTLD(TLDFreeList& a) : arena(a), slot(a.acquire()), owned(false)
+    {
+        if (!slot)   // arena exhausted by a deep steal chain; rare slow path
+        {
+            slot = a.newSlot();
+            owned = true;
+        }
+    }
+    ~ScopedTLD()
+    {
+        if (owned)
+            delete slot;
+        else
+            arena.release(slot);
+    }
+    LookaheadTLD& tld() { return slot->tld; }
+    MotionEstimatorTLD& metld() { return slot->metld; }
+    TLDFreeList& arena; LookaheadSlot* slot; bool owned;
+};
+
+/* Fork-join scheduler for lookahead cost estimation. Fully independent of
+ * x265's ThreadPool: it owns its own libfork lazy_pool workers and a TLD
+ * arena sized for the worst-case number of concurrently live tasks. */
+class ForkJoinPool
 {
 public:
 
-    Lookahead& m_lookahead;
-    Lowres**   m_frames;
-    bool       m_batchMode;
-
-    CostEstimateGroup(Lookahead& l, Lowres** f) : m_lookahead(l), m_frames(f), m_batchMode(false) {}
-
-    /* Cooperative cost estimate using multiple slices of downscaled frame */
-    struct Coop
-    {
-        int  p0, b, p1;
-        bool bDoSearch[2];
-    } m_coop;
-
     enum { MAX_COOP_SLICES = 32 };
-    struct Slice
-    {
-        int  costEst;
-        int  costEstAq;
-        int  intraMbs;
-    } m_slice[MAX_COOP_SLICES];
-
-    int64_t singleCost(int p0, int p1, int b, bool intraPenalty = false);
-
-    /* Batch cost estimates, using one worker thread per estimateFrameCost() call */
     enum { MAX_BATCH_SIZE = 512 };
+
+    /* Batch frame cost / motion search estimates */
     struct Estimate
     {
-        int    p0, b, p1;
-        int    blockRow;
-        int    MElevel;
-        Frame* frame;
-    } m_estimates[MAX_BATCH_SIZE];
+        int p0, b, p1;
+    };
 
-    void add(int p0, int p1, int b);
-    void addRow(int refIdx, int poc, int curPoc, int blockRow, int level, Frame* frame);
-    void finishBatch();
+    /* Batched MCSTF motion search rows (decoupled from frame cost estimates) */
+    struct McstfTask
+    {
+        int    refIdx;
+        int    blockRow;
+        int    level;
+        Frame* frame;
+    };
+
+    /* Worker count is derived from the encoder params only, never from
+     * x265's ThreadPool; also used by Lookahead's constructor to gate
+     * batch/coop-slice heuristics before the pool exists */
+    static int workerCount(const x265_param* param);
+
+    ForkJoinPool(Lookahead& lookahead);
+
+    void    add(Lowres** frames, int p0, int p1, int b);
+    void    finishBatch();
+
+    void    addMcstfRow(int refIdx, int blockRow, int level, Frame* frame);
+    void    finishMcstfBatch();
+
+    Lookahead&    m_lookahead;
+    int           m_numWorkers;
+    lf::lazy_pool m_lf_pool;
+    TLDFreeList   m_arena;
+
+    Estimate      m_estimates[MAX_BATCH_SIZE];
+    int           m_batchSize;
+    Lowres**      m_batchFrames;
+
+    McstfTask     m_mcstfTasks[MAX_BATCH_SIZE];
+    int           m_mcstfSize;
 
 protected:
 
-    static const int s_merange = 16;
-
-    void    processTasks(int workerThreadID);
-
-    int64_t estimateFrameCost(LookaheadTLD& tld, int p0, int p1, int b, bool intraPenalty);
-    void    estimateCUCost(LookaheadTLD& tld, int cux, int cuy, int p0, int p1, int b, bool bDoSearch[2], bool lastRow, int slice, bool hme);
-
-    CostEstimateGroup& operator=(const CostEstimateGroup&);
+    ForkJoinPool& operator=(const ForkJoinPool&);
 };
+
+/* General frame cost query: runs an estimateFrameCost coroutine on the
+ * fork-join pool and blocks the calling (lookahead) thread for the result */
+int64_t singleCost(ForkJoinPool& fjp, Lowres** frames, int p0, int p1, int b, bool intraPenalty = false);
 
 bool computeEdge(pixel* edgePic, const pixel* refPic, pixel* edgeTheta, intptr_t stride, int height, int width, bool bcalcTheta, pixel whitePixel = (pixel)EDGE_THRESHOLD, int32_t* gradMag = NULL);
 }
