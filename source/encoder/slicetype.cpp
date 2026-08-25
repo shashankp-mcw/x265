@@ -4136,18 +4136,17 @@ struct CoopSliceResult
     int intraMbs;
 };
 
-/* Leaf coroutine: single lowres CU cost estimate. Sequenced with lf::call from
- * the slice/frame loops (reverse-raster MV prediction forbids intra-slice
- * parallelism). Writes to `acc` when in cooperative slice mode, or directly to
- * fenc when `acc` is NULL */
-static constexpr auto estimateCUCostAsync =
-    [](auto, LookaheadTLD* tldp, Lookahead* la, Lowres** frames,
-       int cuX, int cuY, int p0, int p1, int b,
-       bool doSearch0, bool doSearch1, bool lastRow,
-       CoopSliceResult* acc, bool hme) -> lf::task<>
+/* Leaf: single lowres CU cost estimate. Deliberately a plain function, not a
+ * coroutine - reverse-raster MV prediction forbids intra-slice parallelism, so
+ * it is always sequenced, and keeping it synchronous lets both the fork-join
+ * and the caller-inline paths share it. Writes to `acc` when in cooperative
+ * slice mode, or directly to fenc when `acc` is NULL */
+static void estimateCUCost(LookaheadTLD& tld, Lookahead* la, Lowres** frames,
+                           int cuX, int cuY, int p0, int p1, int b,
+                           bool doSearch0, bool doSearch1, bool lastRow,
+                           CoopSliceResult* acc, bool hme)
 {
     constexpr int s_merange = 16;
-    LookaheadTLD& tld = *tldp;
     bool bDoSearch[2] = { doSearch0, doSearch1 };
 
     Lowres *fref0 = frames[p0];
@@ -4256,7 +4255,7 @@ static constexpr auto estimateCUCostAsync =
         COPY2_IF_LT(bcost, fencCost, listused, i + 1);
     }
     if (hme)
-        co_return;
+        return;
 
     if (bBidir) /* B, also consider bidir */
     {
@@ -4320,8 +4319,59 @@ static constexpr auto estimateCUCostAsync =
 
     fenc->rowSatds[b - p0][p1 - b][cuY] += bcostAq;
     fenc->lowresCosts[b - p0][p1 - b][cuXY] = (uint16_t)(X265_MIN(bcost, LOWRES_COST_MASK) | (listused << LOWRES_COST_SHIFT));
-    co_return;
-};
+}
+
+/* Walk one band of CU rows bottom-up at one resolution. Shared by the
+ * caller-inline path and the cooperative slice workers; a serial estimate is
+ * just a band spanning the whole frame. `lastRow` starts true at the bottom of
+ * each band, which is what suppresses the below-row MV predictors there */
+static void estimateCUCostBand(LookaheadTLD& tld, Lookahead* la, Lowres** frames,
+                               int p0, int p1, int b, bool doSearch0, bool doSearch1,
+                               int firstY, int lastY, CoopSliceResult* acc, bool hme)
+{
+    const int widthInCU = hme ? la->m_4x4Width : la->m_8x8Width;
+    bool lastRow = true;
+
+    for (int cuY = lastY; cuY >= firstY; cuY--)
+    {
+        if (!hme)
+            frames[b]->rowSatds[b - p0][p1 - b][cuY] = 0;
+
+        for (int cuX = widthInCU - 1; cuX >= 0; cuX--)
+            estimateCUCost(tld, la, frames, cuX, cuY, p0, p1, b, doSearch0, doSearch1, lastRow, acc, hme);
+
+        lastRow = false;
+    }
+}
+
+/* Row band belonging to one cooperative slice, at either resolution */
+static void coopSliceBand(Lookahead* la, int slice, int numSlices, bool hme, int& firstY, int& lastY)
+{
+    if (hme)
+    {
+        int numRowsPerSlice = la->m_4x4Height / la->m_param->lookaheadSlices;
+        numRowsPerSlice = X265_MIN(X265_MAX(numRowsPerSlice, 5), la->m_4x4Height);
+        firstY = numRowsPerSlice * slice;
+        lastY = (slice == numSlices - 1) ? la->m_4x4Height - 1 : numRowsPerSlice * (slice + 1) - 1;
+    }
+    else
+    {
+        firstY = la->m_numRowsPerSlice * slice;
+        lastY = (slice == numSlices - 1) ? la->m_8x8Height - 1 : la->m_numRowsPerSlice * (slice + 1) - 1;
+    }
+}
+
+/* Run the full estimate for one frame on the calling thread, no slicing */
+static void estimateFrameCostSerial(LookaheadTLD& tld, Lookahead* la, Lowres** frames,
+                                    int p0, int p1, int b, bool doSearch0, bool doSearch1)
+{
+    ProfileLookaheadTime(tld.framecostBatchElapsedTime);
+
+    if (la->m_param->bEnableHME)
+        estimateCUCostBand(tld, la, frames, p0, p1, b, doSearch0, doSearch1, 0, la->m_4x4Height - 1, NULL, true);
+
+    estimateCUCostBand(tld, la, frames, p0, p1, b, doSearch0, doSearch1, 0, la->m_8x8Height - 1, NULL, false);
+}
 
 /* One cooperative slice of a frame cost estimate. Acquires its own TLD from
  * the pool arena and walks its band of CU rows bottom-up */
@@ -4338,142 +4388,134 @@ static constexpr auto coopSliceAsync =
     ProfileScopeEvent(estCostCoop);
 
     int firstY, lastY;
-    bool lastRow;
     if (la->m_param->bEnableHME)
     {
-        int numRowsPerSlice = la->m_4x4Height / la->m_param->lookaheadSlices;
-        numRowsPerSlice = X265_MIN(X265_MAX(numRowsPerSlice, 5), la->m_4x4Height);
-        firstY = numRowsPerSlice * slice;
-        lastY = (slice == numSlices - 1) ? la->m_4x4Height - 1 : numRowsPerSlice * (slice + 1) - 1;
-        lastRow = true;
-        for (int cuY = lastY; cuY >= firstY; cuY--)
-        {
-            for (int cuX = la->m_4x4Width - 1; cuX >= 0; cuX--)
-                co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, doSearch0, doSearch1, lastRow, acc, true);
-            lastRow = false;
-        }
+        coopSliceBand(la, slice, numSlices, true, firstY, lastY);
+        estimateCUCostBand(tld, la, frames, p0, p1, b, doSearch0, doSearch1, firstY, lastY, acc, true);
     }
 
-    firstY = la->m_numRowsPerSlice * slice;
-    lastY = (slice == numSlices - 1) ? la->m_8x8Height - 1 : la->m_numRowsPerSlice * (slice + 1) - 1;
-    lastRow = true;
-    for (int cuY = lastY; cuY >= firstY; cuY--)
+    coopSliceBand(la, slice, numSlices, false, firstY, lastY);
+    estimateCUCostBand(tld, la, frames, p0, p1, b, doSearch0, doSearch1, firstY, lastY, acc, false);
+    co_return;
+};
+
+/* Fan out the cooperative slices and fold their accumulators back into fenc.
+ * Sole coop implementation: the synchronous entry point reaches it through
+ * sync_wait, the batch path through co_await, so neither duplicates it */
+static constexpr auto coopFanOutAsync =
+    [](auto, ForkJoinPool* fjp, Lowres** frames, int p0, int p1, int b,
+       bool doSearch0, bool doSearch1, int numSlices) -> lf::task<>
+{
+    CoopSliceResult results[ForkJoinPool::MAX_COOP_SLICES] = {};
+
+    for (int i = 0; i < numSlices - 1; i++)
+        co_await lf::fork[coopSliceAsync](fjp, frames, i, numSlices, p0, p1, b, doSearch0, doSearch1, &results[i]);
+    co_await lf::call[coopSliceAsync](fjp, frames, numSlices - 1, numSlices, p0, p1, b, doSearch0, doSearch1, &results[numSlices - 1]);
+    co_await lf::join;
+
+    Lowres* fenc = frames[b];
+    for (int i = 0; i < numSlices; i++)
     {
-        frames[b]->rowSatds[b - p0][p1 - b][cuY] = 0;
-
-        for (int cuX = la->m_8x8Width - 1; cuX >= 0; cuX--)
-            co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, doSearch0, doSearch1, lastRow, acc, false);
-
-        lastRow = false;
+        fenc->costEst[b - p0][p1 - b] += results[i].costEst;
+        fenc->costEstAq[b - p0][p1 - b] += results[i].costEstAq;
+        if (p1 == b)
+            fenc->intraMbs[b - p0] += results[i].intraMbs;
     }
     co_return;
 };
 
-/* Frame cost estimate coroutine. Forks one coopSliceAsync per slice whenever
- * coop slices are configured and new searches are needed - including from
- * batch mode, which under BondedTaskGroup was forbidden from doing so because
- * the slice accumulators were shared group state; they now live on this
- * coroutine's frame */
+/* Cache probe. The overwhelming majority of frame cost queries hit this, so it
+ * must stay on the caller's thread - never behind a scheduler round-trip */
+static bool frameCostCached(Lowres** frames, int p0, int p1, int b)
+{
+    Lowres* fenc = frames[b];
+    return fenc->costEst[b - p0][p1 - b] >= 0 && fenc->rowSatds[b - p0][p1 - b][0] != -1;
+}
+
+static int64_t frameCostIntraPenalty(Lookahead* la, Lowres** frames, int p0, int b, int64_t score)
+{
+    // arbitrary penalty for I-blocks after B-frames
+    return score + score * frames[b]->intraMbs[b - p0] / (la->m_8x8Blocks * 8);
+}
+
+/* Decide search flags, run weight analysis and reset the accumulators.
+ * Returns the number of cooperative slices to use, 1 meaning run serially */
+static int frameCostPrepare(LookaheadTLD& tld, Lookahead* la, Lowres** frames,
+                            int p0, int p1, int b, bool bDoSearch[2])
+{
+    Lowres* fenc = frames[b];
+
+    bDoSearch[0] = fenc->lowresMvs[0][b - p0][0].x == 0x7FFF;
+    bDoSearch[1] = p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFF;
+
+#if CHECKED_BUILD
+    X265_CHECK(!(p0 < b && fenc->lowresMvs[0][b - p0][0].x == 0x7FFE), "motion search batch duplication L0\n");
+    X265_CHECK(!(p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFE), "motion search batch duplication L1\n");
+    if (bDoSearch[0]) fenc->lowresMvs[0][b - p0][0].x = 0x7FFE;
+    if (bDoSearch[1]) fenc->lowresMvs[1][p1 - b][0].x = 0x7FFE;
+#endif
+
+    fenc->weightedRef[b - p0].isWeighted = false;
+    if (la->m_param->bEnableWeightedPred && bDoSearch[0])
+        tld.weightsAnalyse(*frames[b], *frames[p0]);
+
+    fenc->costEst[b - p0][p1 - b] = 0;
+    fenc->costEstAq[b - p0][p1 - b] = 0;
+
+    /* Cooperative mode pays off only when the estimate needs motion searches
+     * or bidir measurements */
+    if (la->m_numCoopSlices > 1 && ((p1 > b) || bDoSearch[0] || bDoSearch[1]))
+    {
+        X265_CHECK(la->m_numCoopSlices <= ForkJoinPool::MAX_COOP_SLICES, "impossible number of coop slices\n");
+        return la->m_numCoopSlices;
+    }
+    return 1;
+}
+
+/* Apply the B-frame bias and publish the final score */
+static int64_t frameCostFinish(Lookahead* la, Lowres** frames, int p0, int p1, int b)
+{
+    Lowres* fenc = frames[b];
+    int64_t score = fenc->costEst[b - p0][p1 - b];
+
+    if (b != p1)
+        score = score * 100 / (130 + la->m_param->bFrameBias);
+
+    fenc->costEst[b - p0][p1 - b] = score;
+    return score;
+}
+
+/* Frame cost estimate, for callers already inside the fork-join world (the
+ * batch path). Mirrors singleCost() below; the only difference is how the
+ * cooperative slices are reached - co_await here, sync_wait there - because
+ * blocking a worker thread on sync_wait would strand it */
 static constexpr auto estimateFrameCostAsync =
     [](auto, ForkJoinPool* fjp, Lowres** frames, int p0, int p1, int b,
        bool bIntraPenalty) -> lf::task<int64_t>
 {
     Lookahead* la = &fjp->m_lookahead;
-    Lowres*     fenc  = frames[b];
-    x265_param* param = la->m_param;
-    int64_t     score = 0;
+    int64_t score;
 
-    if (fenc->costEst[b - p0][p1 - b] >= 0 && fenc->rowSatds[b - p0][p1 - b][0] != -1)
-        score = fenc->costEst[b - p0][p1 - b];
+    if (frameCostCached(frames, p0, p1, b))
+        score = frames[b]->costEst[b - p0][p1 - b];
     else
     {
-        bool bDoSearch[2];
-        bDoSearch[0] = fenc->lowresMvs[0][b - p0][0].x == 0x7FFF;
-        bDoSearch[1] = p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFF;
-
-#if CHECKED_BUILD
-        X265_CHECK(!(p0 < b && fenc->lowresMvs[0][b - p0][0].x == 0x7FFE), "motion search batch duplication L0\n");
-        X265_CHECK(!(p1 > b && fenc->lowresMvs[1][p1 - b][0].x == 0x7FFE), "motion search batch duplication L1\n");
-        if (bDoSearch[0]) fenc->lowresMvs[0][b - p0][0].x = 0x7FFE;
-        if (bDoSearch[1]) fenc->lowresMvs[1][p1 - b][0].x = 0x7FFE;
-#endif
-
-        /* The weighted reference planes generated here point into this TLD's
-         * wbuffer, so the slot must stay acquired until estimation completes
-         * (coop slice workers read them through fenc->weightedRef) */
+        /* The weighted reference planes point into this TLD's wbuffer, so the
+         * slot must stay acquired until estimation completes (coop slice
+         * workers read them through fenc->weightedRef) */
         ScopedTLD scoped(fjp->m_arena);
-        LookaheadTLD& tld = scoped.tld();
+        bool bDoSearch[2];
+        int numSlices = frameCostPrepare(scoped.tld(), la, frames, p0, p1, b, bDoSearch);
 
-        fenc->weightedRef[b - p0].isWeighted = false;
-        if (param->bEnableWeightedPred && bDoSearch[0])
-            tld.weightsAnalyse(*frames[b], *frames[p0]);
-
-        fenc->costEst[b - p0][p1 - b] = 0;
-        fenc->costEstAq[b - p0][p1 - b] = 0;
-
-        if (la->m_numCoopSlices > 1 && ((p1 > b) || bDoSearch[0] || bDoSearch[1]))
-        {
-            /* Use cooperative mode if the cost estimate is going to need
-             * motion searches or bidir measurements */
-            const int numSlices = la->m_numCoopSlices;
-            X265_CHECK(numSlices <= ForkJoinPool::MAX_COOP_SLICES, "impossible number of coop slices\n");
-
-            CoopSliceResult results[ForkJoinPool::MAX_COOP_SLICES] = {};
-
-            for (int i = 0; i < numSlices - 1; i++)
-                co_await lf::fork[coopSliceAsync](fjp, frames, i, numSlices, p0, p1, b, bDoSearch[0], bDoSearch[1], &results[i]);
-            co_await lf::call[coopSliceAsync](fjp, frames, numSlices - 1, numSlices, p0, p1, b, bDoSearch[0], bDoSearch[1], &results[numSlices - 1]);
-            co_await lf::join;
-
-            for (int i = 0; i < numSlices; i++)
-            {
-                fenc->costEst[b - p0][p1 - b] += results[i].costEst;
-                fenc->costEstAq[b - p0][p1 - b] += results[i].costEstAq;
-                if (p1 == b)
-                    fenc->intraMbs[b - p0] += results[i].intraMbs;
-            }
-        }
+        if (numSlices > 1)
+            co_await lf::call[coopFanOutAsync](fjp, frames, p0, p1, b, bDoSearch[0], bDoSearch[1], numSlices);
         else
-        {
-            ProfileLookaheadTime(tld.framecostBatchElapsedTime);
+            estimateFrameCostSerial(scoped.tld(), la, frames, p0, p1, b, bDoSearch[0], bDoSearch[1]);
 
-            /* Calculate MVs for 1/16th resolution*/
-            bool lastRow;
-            if (param->bEnableHME)
-            {
-                lastRow = true;
-                for (int cuY = la->m_4x4Height - 1; cuY >= 0; cuY--)
-                {
-                    for (int cuX = la->m_4x4Width - 1; cuX >= 0; cuX--)
-                        co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, bDoSearch[0], bDoSearch[1], lastRow, (CoopSliceResult*)NULL, true);
-                    lastRow = false;
-                }
-            }
-            lastRow = true;
-            for (int cuY = la->m_8x8Height - 1; cuY >= 0; cuY--)
-            {
-                fenc->rowSatds[b - p0][p1 - b][cuY] = 0;
-
-                for (int cuX = la->m_8x8Width - 1; cuX >= 0; cuX--)
-                    co_await lf::call[estimateCUCostAsync](&tld, la, frames, cuX, cuY, p0, p1, b, bDoSearch[0], bDoSearch[1], lastRow, (CoopSliceResult*)NULL, false);
-
-                lastRow = false;
-            }
-        }
-
-        score = fenc->costEst[b - p0][p1 - b];
-
-        if (b != p1)
-            score = score * 100 / (130 + param->bFrameBias);
-
-        fenc->costEst[b - p0][p1 - b] = score;
+        score = frameCostFinish(la, frames, p0, p1, b);
     }
 
-    if (bIntraPenalty)
-        // arbitrary penalty for I-blocks after B-frames
-        score += score * fenc->intraMbs[b - p0] / (la->m_8x8Blocks * 8);
-
-    co_return score;
+    co_return bIntraPenalty ? frameCostIntraPenalty(la, frames, p0, b, score) : score;
 };
 
 /* Root coroutine for a batch of frame cost estimates; each child may fork its
@@ -4482,6 +4524,8 @@ static constexpr auto costBatchAsync =
     [](auto, ForkJoinPool* fjp, Lowres** frames,
        const ForkJoinPool::Estimate* est, int n) -> lf::task<>
 {
+    /* Scores are recorded into fenc->costEst by the children; these slots exist
+     * only because a non-void fork needs a return address */
     int64_t scores[ForkJoinPool::MAX_BATCH_SIZE];
 
     for (int i = 0; i < n - 1; i++)
@@ -4549,9 +4593,33 @@ ForkJoinPool::ForkJoinPool(Lookahead& lookahead)
     m_arena.init(m_numWorkers * 4 + 4, lookahead.m_8x8Width, lookahead.m_8x8Height, lookahead.m_8x8Blocks);
 }
 
+/* Frame cost estimate for callers on the lookahead thread. Runs entirely on
+ * the calling thread unless cooperative slicing is actually wanted: the great
+ * majority of calls are memoized hits, and a scheduler round-trip for those
+ * costs orders of magnitude more than the lookup it guards */
 int64_t singleCost(ForkJoinPool& fjp, Lowres** frames, int p0, int p1, int b, bool intraPenalty)
 {
-    return lf::sync_wait(fjp.m_lf_pool, estimateFrameCostAsync, &fjp, frames, p0, p1, b, intraPenalty);
+    Lookahead* la = &fjp.m_lookahead;
+    int64_t score;
+
+    if (frameCostCached(frames, p0, p1, b))
+        score = frames[b]->costEst[b - p0][p1 - b];
+    else
+    {
+        /* Slot stays acquired across the fan-out; see estimateFrameCostAsync */
+        ScopedTLD scoped(fjp.m_arena);
+        bool bDoSearch[2];
+        int numSlices = frameCostPrepare(scoped.tld(), la, frames, p0, p1, b, bDoSearch);
+
+        if (numSlices > 1)
+            lf::sync_wait(fjp.m_lf_pool, coopFanOutAsync, &fjp, frames, p0, p1, b, bDoSearch[0], bDoSearch[1], numSlices);
+        else
+            estimateFrameCostSerial(scoped.tld(), la, frames, p0, p1, b, bDoSearch[0], bDoSearch[1]);
+
+        score = frameCostFinish(la, frames, p0, p1, b);
+    }
+
+    return intraPenalty ? frameCostIntraPenalty(la, frames, p0, b, score) : score;
 }
 
 void ForkJoinPool::add(Lowres** frames, int p0, int p1, int b)
