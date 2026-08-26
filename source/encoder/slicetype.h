@@ -171,6 +171,7 @@ public:
     Lock          m_inputLock;
     Lock          m_outputLock;
     Event         m_outputSignal;
+    LookaheadTLD* m_tld;
     x265_param*   m_param;
     Lowres*       m_lastNonB;
     int*          m_scratch;         // temp buffer for cutree propagate
@@ -284,6 +285,22 @@ protected:
     /*Compute index for positioning B-Ref frames*/
     void     placeBref(Frame** frames, int start, int end, int num, int *brefs);
     void     compCostBref(Lowres **frame, int start, int end, int num);
+};
+
+class PreLookaheadGroup : public BondedTaskGroup
+{
+public:
+
+    Frame* m_preframes[X265_LOOKAHEAD_MAX];
+    Lookahead& m_lookahead;
+
+    PreLookaheadGroup(Lookahead& l) : m_lookahead(l) {}
+
+    void processTasks(int workerThreadID);
+
+protected:
+
+    PreLookaheadGroup& operator=(const PreLookaheadGroup&);
 };
 
 struct LookaheadSlot
@@ -408,9 +425,6 @@ public:
 
     void    addMcstfRow(int refIdx, int blockRow, int level, Frame* frame);
     void    finishMcstfBatch();
-
-    /* Frame pre-analysis (lowres init, AQ, intra estimate) */
-    void    runPreLookahead(Frame* const* preframes, int n);
 
     Lookahead&    m_lookahead;
     int           m_numWorkers;

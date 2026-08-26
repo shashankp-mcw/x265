@@ -1049,6 +1049,7 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
     m_lastNonB = NULL;
     m_isSceneTransition = false;
     m_scratch        = NULL;
+    m_tld            = NULL;
     m_noiseBlurBuf   = NULL;
     m_gradMagBuf     = NULL;
     m_filterThisGOP  = false;
@@ -1208,16 +1209,18 @@ void Lookahead::getWorkerStats(int64_t& framecostBatchElapsedTime, int64_t& coop
 
 bool Lookahead::create()
 {
-    /* All lookahead thread-local data now lives in the fork-join pool's arena,
-     * sized by its own worker count rather than the frame-encoder pool's */
-    m_scratch = X265_MALLOC(int, m_8x8Width);
+    int numTLD = 1 + (m_pool ? m_pool->m_numWorkers : 0);
+    m_tld = new LookaheadTLD[numTLD];
+    for (int i = 0; i < numTLD; i++)
+        m_tld[i].init(m_8x8Width, m_8x8Height, m_8x8Blocks);
+    m_scratch = X265_MALLOC(int, m_tld[0].widthInCU);
 
     m_fjp = new ForkJoinPool(*this);
 
     if (m_param->bEnableTemporalFilter)
         m_origPicBuf = new OrigPicBuffer();
 
-    return m_fjp && m_scratch;
+    return m_tld && m_scratch;
 }
 
 void Lookahead::stopJobs()
@@ -1268,6 +1271,7 @@ void Lookahead::destroy()
     X265_FREE(m_noiseBlurBuf);
     X265_FREE(m_gradMagBuf);
     X265_FREE(m_scratch);
+    delete [] m_tld;
 }
 /* The synchronization of slicetypeDecide is managed here.  The findJob() method
  * polls the occupancy of the input queue. If the queue is
@@ -1822,40 +1826,32 @@ void LookaheadTLD::collectPictureStatistics(Frame *curFrame)
     curFrame->m_lowres.bHistScenecutAnalyzed = false;
 }
 
-/* Pre-analysis of one frame: lowres init, adaptive quant, picture statistics
- * and the intra cost estimate. Frames are independent of each other, so these
- * fork freely - this is the widest parallelism in the whole lookahead, and it
- * belongs on the lookahead's own pool rather than competing with the frame
- * encoders for the shared ThreadPool */
-static constexpr auto preLookaheadAsync =
-    [](auto, ForkJoinPool* fjp, Frame* preFrame) -> lf::task<>
+void PreLookaheadGroup::processTasks(int workerThreadID)
 {
-    Lookahead* la = &fjp->m_lookahead;
-    ScopedTLD scoped(fjp->m_arena);
-    LookaheadTLD& tld = scoped.tld();
+    if (workerThreadID < 0)
+        workerThreadID = m_lookahead.m_pool ? m_lookahead.m_pool->m_numWorkers : 0;
+    LookaheadTLD& tld = m_lookahead.m_tld[workerThreadID];
 
-    ProfileScopeEvent(prelookahead);
-    preFrame->m_lowres.init(preFrame->m_fencPic, preFrame->m_poc, la->m_param->bEnableTemporalFilter);
-    if (la->m_bAdaptiveQuant)
-        tld.calcAdaptiveQuantFrame(preFrame, la->m_param);
+    m_lock.acquire();
+    while (m_jobAcquired < m_jobTotal)
+    {
+        Frame* preFrame = m_preframes[m_jobAcquired++];
+        ProfileScopeEvent(prelookahead);
+        m_lock.release();
+        preFrame->m_lowres.init(preFrame->m_fencPic, preFrame->m_poc, m_lookahead.m_param->bEnableTemporalFilter);
+        if (m_lookahead.m_bAdaptiveQuant)
+            tld.calcAdaptiveQuantFrame(preFrame, m_lookahead.m_param);
 
-    if (la->m_param->bHistBasedSceneCut)
-        tld.collectPictureStatistics(preFrame);
+        if (m_lookahead.m_param->bHistBasedSceneCut)
+            tld.collectPictureStatistics(preFrame);
 
-    tld.lowresIntraEstimate(preFrame->m_lowres, la->m_param->rc.qgSize);
-    preFrame->m_lowresInit = true;
-    co_return;
-};
+        tld.lowresIntraEstimate(preFrame->m_lowres, m_lookahead.m_param->rc.qgSize);
+        preFrame->m_lowresInit = true;
 
-static constexpr auto preLookaheadBatchAsync =
-    [](auto, ForkJoinPool* fjp, Frame* const* preframes, int n) -> lf::task<>
-{
-    for (int i = 0; i < n - 1; i++)
-        co_await lf::fork[preLookaheadAsync](fjp, preframes[i]);
-    co_await lf::call[preLookaheadAsync](fjp, preframes[n - 1]);
-    co_await lf::join;
-    co_return;
-};
+        m_lock.acquire();
+    }
+    m_lock.release();
+}
 
 
 void Lookahead::placeBref(Frame** frames, int start, int end, int num, int *brefs)
@@ -1977,8 +1973,7 @@ bool Lookahead::generatemcstf(Frame * frameEnc, PicList refPic, int poclast)
 /* called by API thread or worker thread with inputQueueLock acquired */
 void Lookahead::slicetypeDecide()
 {
-    Frame*  preframes[X265_LOOKAHEAD_MAX];
-    int     preTotal = 0;
+    PreLookaheadGroup pre(*this);
     Lowres* frames[X265_LOOKAHEAD_MAX + X265_BFRAME_MAX + 4];
     Frame*  list[X265_BFRAME_MAX + 4];
     memset(frames, 0, sizeof(frames));
@@ -2018,7 +2013,7 @@ void Lookahead::slicetypeDecide()
             frames[j + 1] = &curFrame->m_lowres;
 
             if (!curFrame->m_lowresInit)
-                preframes[preTotal++] = curFrame;
+                pre.m_preframes[pre.m_jobTotal++] = curFrame;
 
             curFrame = curFrame->m_next;
         }
@@ -2026,12 +2021,14 @@ void Lookahead::slicetypeDecide()
         maxSearch = j;
     }
 
-    /* perform pre-analysis on frames which need it, on the lookahead's own
-     * fork-join pool */
-    if (preTotal)
+    /* perform pre-analysis on frames which need it, using a bonded task group */
+    if (pre.m_jobTotal)
     {
         ProfileLookaheadTimeCount(m_preLookaheadElapsedTime, m_countPreLookahead);
-        m_fjp->runPreLookahead(preframes, preTotal);
+        if (m_pool)
+            pre.tryBondPeers(*m_pool, pre.m_jobTotal);
+        pre.processTasks(-1);
+        pre.waitForExit();
     }
 
     if(m_param->bEnableFades)
@@ -4641,12 +4638,6 @@ void ForkJoinPool::finishBatch()
         lf::sync_wait(m_lf_pool, costBatchAsync, this, m_batchFrames, m_estimates, m_batchSize);
     m_batchSize = 0;
     m_batchFrames = NULL;
-}
-
-void ForkJoinPool::runPreLookahead(Frame* const* preframes, int n)
-{
-    if (n)
-        lf::sync_wait(m_lf_pool, preLookaheadBatchAsync, this, preframes, n);
 }
 
 void ForkJoinPool::addMcstfRow(int refIdx, int blockRow, int level, Frame* frame)
