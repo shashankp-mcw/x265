@@ -1235,11 +1235,9 @@ void Lookahead::stopJobs()
         if (wait)
             m_outputSignal.wait();
     }
-    if (m_pool && m_param->lookaheadThreads > 0)
-    {
-        for (int i = 0; i < m_numPools; i++)
-            m_pool[i].stopWorkers();
-    }
+    /* m_pool is the encoder's frame-encoder pool, borrowed only for
+     * JobProvider dispatch; the encoder stops and owns it. Lookahead's own
+     * workers live in ForkJoinPool and are joined when it is deleted. */
 }
 
 void Lookahead::destroy()
@@ -1274,8 +1272,6 @@ void Lookahead::destroy()
     X265_FREE(m_gradMagBuf);
     X265_FREE(m_scratch);
     delete [] m_tld;
-    if (m_param->lookaheadThreads > 0)
-        delete [] m_pool;
 }
 /* The synchronization of slicetypeDecide is managed here.  The findJob() method
  * polls the occupancy of the input queue. If the queue is
@@ -4157,7 +4153,7 @@ static void estimateCUCost(LookaheadTLD& tld, Lookahead* la, Lowres** frames,
 
     const int widthInCU = hme ? la->m_4x4Width : la->m_8x8Width;
     const int heightInCU = hme ? la->m_4x4Height : la->m_8x8Height;
-    const int bBidir = (b < p1);
+    const int bBidir = (b < p1);    
     const int cuXY = cuX + cuY * widthInCU;
     const int cuXY_4x4 = (cuX / 2) + (cuY / 2) * widthInCU / 2;
     const int cuSize = X265_LOWRES_CU_SIZE;

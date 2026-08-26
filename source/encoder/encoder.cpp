@@ -361,25 +361,22 @@ void Encoder::create()
     else if (m_scalingList.parseScalingList(m_param->scalingLists))
         m_aborted = true;
 
+    /* Lookahead cost estimation runs on its own libfork pool (ForkJoinPool),
+     * sized by --lookahead-threads, so no dedicated x265 ThreadPool is spawned
+     * for it any more. allocThreadPools() above has already withheld
+     * lookaheadThreads workers from the first frame-encoder pool, so the two
+     * pools partition the machine rather than oversubscribing it. The pool
+     * passed here is used only for JobProvider dispatch of slicetypeDecide(),
+     * and is owned by the encoder, never by Lookahead. */
     int lookaheadPools = m_numPools;
-    ThreadPool* lookAheadThreadPool = 0;
-    if (m_param->lookaheadThreads > 0)
-    {
-        int lookaheadTmePools = 0;
-        lookAheadThreadPool = ThreadPool::allocThreadPools(p, lookaheadPools, lookaheadTmePools, 1);
-    }
-    else
-        lookAheadThreadPool = m_threadPool ? &m_threadPool[m_numTmePools] : NULL;
+    ThreadPool* lookAheadThreadPool = m_threadPool ? &m_threadPool[m_numTmePools] : NULL;
     m_lookahead = new Lookahead(m_param, lookAheadThreadPool);
     m_lookahead->m_numPools = lookaheadPools;
-    if (lookaheadPools)
+    if (lookaheadPools && lookAheadThreadPool)
     {
         m_lookahead->m_jpId = lookAheadThreadPool[0].m_numProviders++;
         lookAheadThreadPool[0].m_jpTable[m_lookahead->m_jpId] = m_lookahead;
     }
-    if (m_param->lookaheadThreads > 0)
-        for (int i = 0; i < lookaheadPools; i++)
-            lookAheadThreadPool[i].start();
 
     char buf[128];
     int len = 0;

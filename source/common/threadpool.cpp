@@ -629,6 +629,12 @@ ThreadPool* ThreadPool::allocThreadPools(x265_param* p, int& numPools, int& numT
                 x265_log(p, X265_LOG_DEBUG, "Setting lookahead threads to a maximum of half the total number of threads\n");
             }
 
+            /* isThreadsReserved built a dedicated ThreadPool for lookahead.
+             * Lookahead now runs its cost estimation on its own libfork pool,
+             * so nothing requests that any more; the branch is kept only so the
+             * reservation arithmetic below reads symmetrically. The live path
+             * is the frame-encoder one, which withholds lookaheadThreads
+             * workers from the first frame pool for the libfork pool to use. */
             if (isThreadsReserved)
             {
                 numThreads = p->lookaheadThreads;
