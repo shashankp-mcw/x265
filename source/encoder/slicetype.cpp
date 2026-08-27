@@ -45,6 +45,13 @@
 
 using namespace X265_NS;
 
+namespace X265_NS {
+/* defined with the fork-join machinery at the bottom of this file */
+bool frameCostCached(Lowres** frames, int p0, int p1, int b);
+void speculateNextDecision(Lookahead* la);
+}
+
+
 namespace {
 
 /* Compute variance to derive AC energy of each block */
@@ -1238,10 +1245,17 @@ void Lookahead::stopJobs()
     /* m_pool is the encoder's frame-encoder pool, borrowed only for
      * JobProvider dispatch; the encoder stops and owns it. Lookahead's own
      * workers live in ForkJoinPool and are joined when it is deleted. */
+
+    if (m_fjp)
+        m_fjp->quiesce();
 }
 
 void Lookahead::destroy()
 {
+    /* a speculative batch may still reference frames in the queues */
+    if (m_fjp)
+        m_fjp->quiesce();
+
     // these two queues will be empty unless the encode was aborted
     while (!m_inputQueue.empty())
     {
@@ -2079,6 +2093,10 @@ void Lookahead::slicetypeDecide()
         }
     }
 
+    /* Any speculative cost batch launched by the previous decision must
+     * retire before this decision reads or writes per-frame cost state */
+    m_fjp->quiesce();
+
     if (m_lastNonB &&
         ((m_param->bFrameAdaptive && m_param->bframes) ||
          m_param->rc.cuTree || m_param->scenecutThreshold || m_param->bHistBasedSceneCut ||
@@ -2617,6 +2635,40 @@ void Lookahead::slicetypeDecide()
             p1 = b = bframes + 1;
             p0 = (IS_X265_TYPE_I(frames[bframes + 1]->sliceType)) ? b : 0;
 
+            /* Enumerate every estimate the serial calls below will make (one
+             * per frame of the mini-GOP, so no two share a motion search) and
+             * run them as one batch; the singleCost calls then all hit the
+             * memoized results. Identical estimates, so output is unchanged */
+            if (m_fjp->m_numWorkers > 1 && !getenv("XNO3B"))
+            {
+                if (!frameCostCached(frames, p0, p1, b))
+                    m_fjp->add(frames, p0, p1, b);
+                if (!(m_param->bEnableTemporalSubLayers > 1) && bframes)
+                {
+                    int q0 = 0;
+                    bool isp0available = frames[bframes + 1]->sliceType != X265_TYPE_IDR;
+                    for (int qb = 1; qb <= bframes; qb++)
+                    {
+                        int q1;
+                        if (!isp0available)
+                            q0 = qb;
+                        if (frames[qb]->sliceType == X265_TYPE_B)
+                            for (q1 = qb; frames[q1]->sliceType == X265_TYPE_B; q1++)
+                                ;
+                        else
+                            q1 = bframes + 1;
+                        if (!frameCostCached(frames, q0, q1, qb))
+                            m_fjp->add(frames, q0, q1, qb);
+                        if (frames[qb]->sliceType == X265_TYPE_BREF)
+                        {
+                            q0 = qb;
+                            isp0available = true;
+                        }
+                    }
+                }
+                m_fjp->finishBatch();
+            }
+
             singleCost(*m_fjp, frames, p0, p1, b);
 
             if (m_param->bEnableTemporalSubLayers > 1 && bframes)
@@ -2732,6 +2784,11 @@ void Lookahead::slicetypeDecide()
 
         m_outputLock.release();
     }
+
+    /* Predict the estimates the next decision will request and run them on
+     * the fork-join pool while this thread returns to the job queue and the
+     * next pre-lookahead runs on the encoder pool */
+    speculateNextDecision(this);
 }
 
 void Lookahead::vbvLookahead(Lowres **frames, int numFrames, int keyframe)
@@ -2968,6 +3025,22 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
                 m_bBatchFrameCosts &= m_fjp->m_numWorkers > 12;
                 m_fjp->finishBatch();
             }
+        }
+
+        /* The scenecut walk below requests these P costs one at a time; hand
+         * the whole set to the fork-join pool as one wide batch first so the
+         * serial walk becomes memoized lookups. Only estimates the walk makes
+         * unconditionally may be prefetched: scenecut() treats the mere
+         * availability of a cost (costEst > -1) as an input, so computing
+         * anything extra - even with identical values - changes decisions */
+        if (m_param->bframes && m_fjp->m_numWorkers > 1 && !m_param->bHistBasedSceneCut && !getenv("XNO3A"))
+        {
+            ProfileLookaheadTimeCount(m_framecostElapsedTime, m_countFramecosts);
+            int maxp1 = X265_MIN(1 + m_param->bframes, origNumFrames);
+            for (int cp1 = 1; cp1 <= maxp1; cp1++)
+                if (!frameCostCached(frames, 0, cp1, cp1))
+                    m_fjp->add(frames, 0, cp1, cp1);
+            m_fjp->finishBatch();
         }
 
         int numBFrames = 0;
@@ -4422,7 +4495,7 @@ static constexpr auto coopFanOutAsync =
 
 /* Cache probe. The overwhelming majority of frame cost queries hit this, so it
  * must stay on the caller's thread - never behind a scheduler round-trip */
-static bool frameCostCached(Lowres** frames, int p0, int p1, int b)
+bool frameCostCached(Lowres** frames, int p0, int p1, int b)
 {
     Lowres* fenc = frames[b];
     return fenc->costEst[b - p0][p1 - b] >= 0 && fenc->rowSatds[b - p0][p1 - b][0] != -1;
@@ -4581,12 +4654,212 @@ ForkJoinPool::ForkJoinPool(Lookahead& lookahead)
     , m_batchSize(0)
     , m_batchFrames(NULL)
     , m_mcstfSize(0)
+    , m_specExit(false)
+    , m_specBusy(false)
+    , m_specCount(0)
 {
     /* Only started tasks hold arena slots. Workers execute one leaf at a time,
      * but a worker suspended at a join (its parent holding a slot for the
      * weighted reference planes) can steal and start further estimates, so
      * allow a nesting margin beyond one slot per worker */
     m_arena.init(m_numWorkers * 4 + 4, lookahead.m_8x8Width, lookahead.m_8x8Height, lookahead.m_8x8Blocks);
+
+    m_specThread = std::thread(&ForkJoinPool::specLoop, this);
+}
+
+ForkJoinPool::~ForkJoinPool()
+{
+    {
+        std::unique_lock<std::mutex> lk(m_specLock);
+        m_specExit = true;
+    }
+    m_specCv.notify_all();
+    if (m_specThread.joinable())
+        m_specThread.join();
+}
+
+/* Pump thread: submits speculative batches to the pool so the submitting
+ * (lookahead) thread never blocks on them */
+void ForkJoinPool::specLoop()
+{
+    std::unique_lock<std::mutex> lk(m_specLock);
+    while (true)
+    {
+        m_specCv.wait(lk, [this] { return m_specExit || m_specBusy; });
+        if (m_specExit)
+        {
+            /* drop any batch that never ran so quiesce() cannot deadlock */
+            m_specBusy = false;
+            m_specCv.notify_all();
+            break;
+        }
+        lk.unlock();
+        lf::sync_wait(m_lf_pool, costBatchAsync, this, m_specFrames, m_specEstimates, m_specCount);
+        lk.lock();
+        m_specBusy = false;
+        m_specCv.notify_all();
+    }
+}
+
+void ForkJoinPool::speculate(Lowres** frames, int frameCount, const Estimate* est, int count)
+{
+    if (count <= 0)
+        return;
+    {
+        std::unique_lock<std::mutex> lk(m_specLock);
+        if (m_specBusy || m_specExit)
+            return;
+        memcpy(m_specFrames, frames, sizeof(Lowres*) * frameCount);
+        memcpy(m_specEstimates, est, sizeof(Estimate) * count);
+        m_specCount = count;
+        m_specBusy = true;
+    }
+    m_specCv.notify_all();
+}
+
+void ForkJoinPool::quiesce()
+{
+    std::unique_lock<std::mutex> lk(m_specLock);
+    m_specCv.wait(lk, [this] { return !m_specBusy; });
+}
+
+/* Predict the frame cost estimates the next slicetypeDecide will request and
+ * run them on the fork-join pool while the lookahead thread queues outputs,
+ * returns to the job queue, and the next pre-lookahead runs. Results land in
+ * the per-frame memoization arrays, so a correct prediction turns the next
+ * decision's serial cost chain into cache hits.
+ *
+ * Strict-subset rule: only estimates the next decision is certain to make may
+ * be speculated. The lookahead treats cost *availability* (costEst > -1,
+ * lowresMvs != 0x7FFF) as an input in several places (scenecut's avgSatdCost,
+ * the batch skip logic), so computing anything extra - even with identical
+ * values - changes decisions. When the future window size is uncertain
+ * (frames still arriving, pre-lookahead pending), under-speculate.
+ *
+ * Two tuples in one batch must also not trigger the same motion search
+ * (concurrent writers to one MV array): each tuple claims the searches it
+ * would run and later tuples needing a claimed search are dropped */
+void speculateNextDecision(Lookahead* la)
+{
+    ForkJoinPool& fjp = *la->m_fjp;
+    const x265_param* param = la->m_param;
+
+    if (getenv("XNOSPEC") || fjp.m_numWorkers <= 1 || param->rc.bStatRead || param->bHistBasedSceneCut ||
+        param->rc.zonefileCount || param->chunkEnd || param->bResetZoneConfig ||
+        param->bIntraRefresh || !param->bframes)
+        return;
+
+    Lowres* frames[X265_LOOKAHEAD_MAX + X265_BFRAME_MAX + 4];
+    int maxSearch = X265_MIN(param->lookaheadDepth, X265_LOOKAHEAD_MAX);
+
+    frames[0] = la->m_lastNonB;
+    if (!frames[0])
+        return;
+
+    /* count the undecided, already-initialized head of the input queue; the
+     * real window can only be longer (more arrivals, pre-lookahead), never
+     * shorter */
+    int framecnt = 0;
+    bool windowCertain = true;
+    la->m_inputLock.acquire();
+    Frame* curFrame = la->m_inputQueue.first();
+    for (int j = 0; j < maxSearch && curFrame; j++, curFrame = curFrame->m_next)
+    {
+        if (!curFrame->m_lowresInit)
+        {
+            windowCertain = false;
+            break;
+        }
+        if (curFrame->m_lowres.sliceType != X265_TYPE_AUTO)
+            break;
+        frames[framecnt + 1] = &curFrame->m_lowres;
+        framecnt++;
+    }
+    if (framecnt < maxSearch && !curFrame)
+        windowCertain = false; /* queue may still grow before the next decision */
+    la->m_inputLock.release();
+
+    if (framecnt < 1)
+        return;
+
+    /* mirror slicetypeAnalyse's window arithmetic (zones/chunks are gated out
+     * above) */
+    int keyFrameLimit = param->keyframeMax + la->m_lastKeyframe - frames[0]->frameNum - 1;
+    int keyintLimit = (param->gopLookahead && keyFrameLimit <= param->bframes + 1) ?
+                      keyFrameLimit + param->gopLookahead : keyFrameLimit;
+    int origNumFrames = X265_MIN(framecnt, keyintLimit);
+    int numFrames = origNumFrames;
+    bool bIsVbvLookahead = param->rc.vbvBufferSize && param->lookaheadDepth;
+    if (bIsVbvLookahead)
+        numFrames = framecnt;
+    else if (param->bOpenGOP && numFrames < framecnt)
+        numFrames++;
+    else if (numFrames <= 0)
+        return; /* next analysis will just mark an I frame */
+
+    ForkJoinPool::Estimate est[ForkJoinPool::MAX_BATCH_SIZE];
+    int count = 0;
+
+    bool claimed[X265_LOOKAHEAD_MAX + 2][2][X265_BFRAME_MAX + 2];
+    memset(claimed, 0, sizeof(claimed));
+
+    auto tryAdd = [&](int p0, int b, int p1)
+    {
+        if (count >= ForkJoinPool::MAX_BATCH_SIZE)
+            return;
+        if (frameCostCached(frames, p0, p1, b))
+            return;
+        for (int i = 0; i < count; i++)
+            if (est[i].p0 == p0 && est[i].b == b && est[i].p1 == p1)
+                return;
+        bool needL0 = frames[b]->lowresMvs[0][b - p0][0].x == 0x7FFF;
+        bool needL1 = p1 > b && frames[b]->lowresMvs[1][p1 - b][0].x == 0x7FFF;
+        if ((needL0 && claimed[b][0][b - p0]) || (needL1 && claimed[b][1][p1 - b]))
+            return;
+        if (needL0)
+            claimed[b][0][b - p0] = true;
+        if (needL1)
+            claimed[b][1][p1 - b] = true;
+        est[count].p0 = p0;
+        est[count].b = b;
+        est[count].p1 = p1;
+        count++;
+    };
+
+    /* the scenecut walk requests exactly these, serially, at the head of the
+     * next analysis; a longer real window only extends the set */
+    int maxp1 = X265_MIN(1 + param->bframes, origNumFrames);
+    for (int cp1 = 1; cp1 <= maxp1; cp1++)
+        tryAdd(0, cp1, cp1);
+
+    /* the b-adapt trellis motion search set (mirrors the batch loop in
+     * slicetypeAnalyse). The p1 pairing depends on the window length: when a
+     * tuple's pairing could differ under a longer real window, skip it */
+    if (la->m_bBatchMotionSearch)
+    {
+        for (int b = 2; b < numFrames; b++)
+        {
+            for (int i = 1; i <= param->bframes + 1; i++)
+            {
+                int p0 = b - i;
+                if (p0 < 0)
+                    continue;
+                if (frames[b]->lowresMvs[0][i][0].x != 0x7FFF)
+                    continue;
+                int p1 = b + i;
+                if (p1 >= numFrames || frames[b]->lowresMvs[1][i][0].x != 0x7FFF)
+                {
+                    if (p1 >= numFrames && !windowCertain &&
+                        frames[b]->lowresMvs[1][i][0].x == 0x7FFF)
+                        continue; /* pairing may flip to (p0, b, b+i) */
+                    p1 = b;
+                }
+                tryAdd(p0, b, p1);
+            }
+        }
+    }
+
+    fjp.speculate(frames, framecnt + 1, est, count);
 }
 
 /* Frame cost estimate for callers on the lookahead thread. Runs entirely on

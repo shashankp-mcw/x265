@@ -35,6 +35,8 @@
 #include <libfork.hpp>
 #include <libfork/schedule/lazy_pool.hpp>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace X265_NS {
 // private namespace
@@ -419,12 +421,22 @@ public:
     static int workerCount(const x265_param* param);
 
     ForkJoinPool(Lookahead& lookahead);
+    ~ForkJoinPool();
 
     void    add(Lowres** frames, int p0, int p1, int b);
     void    finishBatch();
 
     void    addMcstfRow(int refIdx, int blockRow, int level, Frame* frame);
     void    finishMcstfBatch();
+
+    /* Cross-decision speculation: hand a predicted batch of estimates to the
+     * pump thread, which runs it on the pool while the lookahead thread is
+     * busy elsewhere (output queueing, the next pre-lookahead). quiesce()
+     * must retire any in-flight batch before per-frame cost state is touched
+     * again; a wrong prediction only wastes idle pool time, never changes
+     * output (results are memoized identically) */
+    void    speculate(Lowres** frames, int frameCount, const Estimate* est, int count);
+    void    quiesce();
 
     Lookahead&    m_lookahead;
     int           m_numWorkers;
@@ -437,6 +449,17 @@ public:
 
     McstfTask     m_mcstfTasks[MAX_BATCH_SIZE];
     int           m_mcstfSize;
+
+    std::thread             m_specThread;
+    std::mutex              m_specLock;
+    std::condition_variable m_specCv;
+    bool                    m_specExit;
+    bool                    m_specBusy;
+    int                     m_specCount;
+    Lowres*                 m_specFrames[X265_LOOKAHEAD_MAX + X265_BFRAME_MAX + 4];
+    Estimate                m_specEstimates[MAX_BATCH_SIZE];
+
+    void    specLoop();
 
 protected:
 
