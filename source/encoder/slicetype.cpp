@@ -1124,7 +1124,18 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
         m_param->lookaheadSlices = 0;
     }
 
-    if (m_param->lookaheadSlices > 1)
+    /* XNOCOOP: force every frame cost estimate to run serially (one worker
+     * per estimate) while batch mode still forks estimates in parallel -
+     * isolates frame-level from slice-level parallelism for A/B runs. Same
+     * effect on estimation as --lookahead-slices 0, but leaves the reported
+     * lslices/tools string and any param-derived heuristics untouched */
+    if (getenv("XNOCOOP"))
+    {
+        x265_log(param, X265_LOG_WARNING, "XNOCOOP set; coop slices disabled, batch-only parallelism\n");
+        m_numRowsPerSlice = m_8x8Height;
+        m_numCoopSlices = 1;
+    }
+    else if (m_param->lookaheadSlices > 1)
     {
         m_numRowsPerSlice = m_8x8Height / m_param->lookaheadSlices;
         m_numRowsPerSlice = X265_MAX(m_numRowsPerSlice, 10);            // at least 10 rows per slice
@@ -4744,8 +4755,10 @@ void speculateNextDecision(Lookahead* la)
     ForkJoinPool& fjp = *la->m_fjp;
     const x265_param* param = la->m_param;
 
+    /* bResetZoneConfig defaults to 1 and only takes effect when zones are
+     * actually configured, so gate on zonefileCount alone */
     if (getenv("XNOSPEC") || fjp.m_numWorkers <= 1 || param->rc.bStatRead || param->bHistBasedSceneCut ||
-        param->rc.zonefileCount || param->chunkEnd || param->bResetZoneConfig ||
+        param->rc.zonefileCount || param->chunkEnd ||
         param->bIntraRefresh || !param->bframes)
         return;
 
