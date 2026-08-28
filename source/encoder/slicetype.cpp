@@ -1132,22 +1132,39 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
     if (getenv("XNOCOOP"))
     {
         x265_log(param, X265_LOG_WARNING, "XNOCOOP set; coop slices disabled, batch-only parallelism\n");
-        m_numRowsPerSlice = m_8x8Height;
         m_numCoopSlices = 1;
     }
     else if (m_param->lookaheadSlices > 1)
     {
-        m_numRowsPerSlice = m_8x8Height / m_param->lookaheadSlices;
-        m_numRowsPerSlice = X265_MAX(m_numRowsPerSlice, 10);            // at least 10 rows per slice
-        m_numRowsPerSlice = X265_MIN(m_numRowsPerSlice, m_8x8Height);   // but no more than the full picture
-        m_numCoopSlices = m_8x8Height / m_numRowsPerSlice;
-        m_param->lookaheadSlices = m_numCoopSlices;                     // report actual final slice count
+        /* --lookahead-slices is the requested minimum, not the final answer. When
+         * frame cost batching will not run, cooperative slicing is the only
+         * parallelism inside the lookahead pool, so cut the frame into as many
+         * bands as there are workers - at 4K and above the fixed default of 8
+         * leaves a wide pool half idle. The MIN_COOP_SLICE_ROWS floor still caps
+         * the count, which is what keeps the fraction of the frame lost to slice
+         * boundaries roughly constant across resolutions */
+        int reqSlices = m_param->lookaheadSlices;
+        const int workers = ForkJoinPool::workerCount(m_param);
+        const bool batchWillRun = m_bBatchMotionSearch && workers >= 4;
+
+        if (!batchWillRun)
+            reqSlices = X265_MAX(reqSlices, workers);
+        if (const char* env = getenv("XLASLICES"))                      // forced count, for A/B sweeps
+            reqSlices = atoi(env);
+        reqSlices = X265_MAX(1, X265_MIN(reqSlices, (int)ForkJoinPool::MAX_COOP_SLICES));
+
+        int rowsPerSlice = X265_MAX(m_8x8Height / reqSlices, (int)ForkJoinPool::MIN_COOP_SLICE_ROWS);
+        rowsPerSlice = X265_MIN(rowsPerSlice, m_8x8Height);
+        m_numCoopSlices = m_8x8Height / rowsPerSlice;
+        if (m_param->bEnableHME)
+            m_numCoopSlices = X265_MIN(m_numCoopSlices, m_4x4Height / (int)ForkJoinPool::MIN_COOP_SLICE_ROWS_HME);
+        m_numCoopSlices = X265_MAX(m_numCoopSlices, 1);
+
+        x265_log(m_param, X265_LOG_DEBUG, "lookahead cooperative slices: %d (requested %d, %d workers)\n",
+                 m_numCoopSlices, reqSlices, workers);
     }
     else
-    {
-        m_numRowsPerSlice = m_8x8Height;
         m_numCoopSlices = 1;
-    }
     if (param->gopLookahead && (param->gopLookahead > (param->lookaheadDepth - param->bframes - 2)))
     {
         param->gopLookahead = X265_MAX(0, param->lookaheadDepth - param->bframes - 2);
@@ -4424,21 +4441,16 @@ static void estimateCUCostBand(LookaheadTLD& tld, Lookahead* la, Lowres** frames
     }
 }
 
-/* Row band belonging to one cooperative slice, at either resolution */
+/* Row band belonging to one cooperative slice, at either resolution. The split is
+ * proportional, so the bands tile the grid exactly, differ by at most one row and
+ * stay valid for any numSlices <= rows. An equal split also matters for the join:
+ * handing the remainder to the last slice would put it on the critical path */
 static void coopSliceBand(Lookahead* la, int slice, int numSlices, bool hme, int& firstY, int& lastY)
 {
-    if (hme)
-    {
-        int numRowsPerSlice = la->m_4x4Height / la->m_param->lookaheadSlices;
-        numRowsPerSlice = X265_MIN(X265_MAX(numRowsPerSlice, 5), la->m_4x4Height);
-        firstY = numRowsPerSlice * slice;
-        lastY = (slice == numSlices - 1) ? la->m_4x4Height - 1 : numRowsPerSlice * (slice + 1) - 1;
-    }
-    else
-    {
-        firstY = la->m_numRowsPerSlice * slice;
-        lastY = (slice == numSlices - 1) ? la->m_8x8Height - 1 : la->m_numRowsPerSlice * (slice + 1) - 1;
-    }
+    const int rows = hme ? la->m_4x4Height : la->m_8x8Height;
+    X265_CHECK(numSlices >= 1 && numSlices <= rows, "coop slice count exceeds row count\n");
+    firstY = (int)(((int64_t)rows * slice) / numSlices);
+    lastY = (int)(((int64_t)rows * (slice + 1)) / numSlices) - 1;
 }
 
 /* Run the full estimate for one frame on the calling thread, no slicing */

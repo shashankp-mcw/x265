@@ -189,7 +189,6 @@ public:
     int           m_8x8Blocks;
     int           m_cuCount;
     int           m_numCoopSlices;
-    int           m_numRowsPerSlice;
     int           m_inputCount;
     double        m_cuTreeStrength;
 
@@ -399,6 +398,12 @@ public:
 
     enum { MAX_COOP_SLICES = 32 };
     enum { MAX_BATCH_SIZE = 512 };
+
+    /* Minimum band height of a cooperative slice, per lowres grid. These floors
+     * are what cap the slice count at a given resolution, keeping the fraction
+     * of the frame lost to slice boundaries roughly constant across sources */
+    enum { MIN_COOP_SLICE_ROWS = 10 };      /* 8x8 lowres grid */
+    enum { MIN_COOP_SLICE_ROWS_HME = 5 };   /* 4x4 (quarter-res) grid */
 
     /* Batch frame cost / motion search estimates */
     struct Estimate
